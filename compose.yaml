@@ -1,0 +1,23 @@
+services:
+  claude-code:
+    init: true
+    build: .
+    container_name: claude-code
+    group_add:
+      - "${DOCKER_GID:-999}"   # match host GID
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .config:/var/www/.config
+      - .claude:/var/www/.claude
+      - .claude.json:/var/www/.claude.json
+      - ${LOCAL_PATH}:/app
+      - .:/claude-code
+    networks:
+      - claude-code
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+networks:
+  claude-code:
+    name: "${DOCKER_NETWORK:-claude-code}"
+    external: true

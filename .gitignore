@@ -1,0 +1,8 @@
+.config/*
+!.config/
+!.config/.gitkeep
+.claude/*
+!.claude/
+!.claude/.gitkeep
+.env
+.claude.json
