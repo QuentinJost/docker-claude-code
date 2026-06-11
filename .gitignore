@@ -4,5 +4,6 @@
 .claude/*
 !.claude/
 !.claude/.gitkeep
+!.claude/statusline.sh
 .env
 .claude.json
