@@ -13,6 +13,14 @@ RUN apt-get update && apt-get install -y \
     git \
     ca-certificates curl gnupg lsb-release \
     jq pipx \
+    wget 
+
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+ && wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y gh \
  && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -85,6 +93,7 @@ RUN mkdir -p /var/www/.cache/claude /var/www/.npm /var/www/.local \
 ENV HOME=/var/www \
     PATH="/var/www/.local/bin:${PATH}"
 
+
 USER www-data
 
 # Migrate to the native, sudo-free, self-updating Claude Code build.
@@ -93,6 +102,6 @@ RUN claude install
 
 # Register graphify as a Claude Code skill in www-data's home
 # (-> /var/www/.claude/skills/graphify).
-RUN graphify install --platform claude
+RUN graphify install
 
 CMD ["sleep", "infinity"]
