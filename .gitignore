@@ -5,5 +5,8 @@
 !.claude/
 !.claude/.gitkeep
 !.claude/statusline.sh
+!.claude/mods/
+# types laid down by the engine at every load of a mod
+.claude/mods/*/.claude-plugin/types/
 .env
 .claude.json
