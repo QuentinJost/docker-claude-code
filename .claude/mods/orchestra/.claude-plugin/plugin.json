@@ -1,6 +1,6 @@
 {
   "name": "orchestra",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Orchestrator (run it on Fable): queues tasks, sizes each session (model, effort), runs one task per background session with a cortex agent, reviews with a reviewer agent, redispatches until approved",
   "types": "./types/index.d.ts"
 }

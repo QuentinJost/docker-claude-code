@@ -11,15 +11,18 @@ import {
   ORCHESTRATOR_MODEL,
   REVIEWER,
   SIZING_SYSTEM,
+  UPGRADE_SYSTEM,
   WORK_FLOOR,
   agentName,
   atLeast,
   defaultSizing,
+  firstLine,
   parseStatus,
   parseNeeds,
   parseOverrides,
   parseSizing,
   parseTask,
+  parseUpgrade,
   parseVerdict,
   plan,
   reviewBrief,
@@ -27,6 +30,7 @@ import {
   reworkBrief,
   roleFor,
   sizingPrompt,
+  upgradePrompt,
   workerAgent,
   workerBrief,
   workerName,
@@ -213,21 +217,28 @@ async function size($: EngineInterface, repo: string, role: string, text: string
   return { ...sized, work, why }
 }
 
-async function addTask($: EngineInterface, input: string) {
+/** What a typed task holds: `<repo> <description> [@role] [model:… effort:…]`. */
+type Input = { repo: string; role: string; text: string; work: Partial<Setting> }
+
+const parseInput = (input: string): Input | null => {
   const parsed = parseTask(input)
   if (!parsed) {
-    $.ui.toast('Usage: <repo> <description> [@role]')
-    return
+    return null
   }
   const overrides = parseOverrides(parsed.text)
   const { role, text } = roleFor(parsed.repo, overrides.text)
-  const sizing = await size($, parsed.repo, role, text, overrides.work)
+
+  return { repo: parsed.repo, role, text, work: overrides.work }
+}
+
+async function queueTask($: EngineInterface, { repo, role, text, work }: Input) {
+  const sizing = await size($, repo, role, text, work)
   const at = await $.clock.now()
   const list = await read($, tasks)
   const id = list.reduce((max, t) => Math.max(max, t.id), 0) + 1
   const task: Task = {
     id,
-    repo: parsed.repo,
+    repo,
     role,
     text,
     state: 'queued',
@@ -246,9 +257,49 @@ async function addTask($: EngineInterface, input: string) {
   await log($, {
     direction: 'notice',
     peer: `#${id}`,
-    text: `queued for ${role} in ${parsed.repo} · dev ${setting(sizing.work)} · review ${setting(sizing.review)} · ${sizing.why}`,
+    text: `queued for ${role} in ${repo} · dev ${setting(sizing.work)} · review ${setting(sizing.review)} · ${sizing.why}`,
   })
   await dispatch($)
+
+  return id
+}
+
+async function addTask($: EngineInterface, input: string) {
+  const parsed = parseInput(input)
+  if (!parsed) {
+    $.ui.toast('Usage: <repo> <description> [@role]')
+    return
+  }
+  await queueTask($, parsed)
+}
+
+/**
+ * `/orch prompt`: the orchestrator's model, as Prompt Manager, rewrites the request into a brief
+ * (objective, context, task, constraints, done-when) before it is queued; a request it cannot
+ * make sense of comes back as questions, and nothing is queued.
+ */
+async function upgradeTask($: EngineInterface, input: string): Promise<string> {
+  const parsed = parseInput(input)
+  if (!parsed) {
+    return 'Usage: /orch prompt <repo> <request> [@role] [model:… effort:…]'
+  }
+  const reply = await $.model
+    .complete({ model: ORCHESTRATOR_MODEL, system: UPGRADE_SYSTEM, prompt: upgradePrompt(parsed.repo, parsed.role, parsed.text), maxTokens: 2000, effort: 'high' })
+    .catch(() => null)
+  const upgrade = reply?.isAnswered ? parseUpgrade(reply.text) : null
+  if (!upgrade) {
+    await log($, { direction: 'notice', peer: 'prompt', text: `no usable brief from ${ORCHESTRATOR_MODEL}; nothing queued` })
+    return `The orchestrator model gave no usable brief; nothing queued. Retry, or queue it as typed with /orch task.`
+  }
+  if ('questions' in upgrade) {
+    await log($, { direction: 'notice', peer: 'prompt', text: `unclear request, ${upgrade.questions.length} question(s) for you; nothing queued` })
+    return ['Not queued: the request needs settling first.', ...upgrade.questions.map(q => `- ${q}`), '', 'Answer in a new /orch prompt.'].join('\n')
+  }
+  const text = `${upgrade.title}\n\n${upgrade.brief}`
+  const id = await queueTask($, { ...parsed, text })
+  await log($, { direction: 'notice', peer: `#${id}`, text: `brief written by the Prompt Manager from: ${oneLine(parsed.text)}` })
+
+  return [`Task #${id} queued in ${parsed.repo} for ${parsed.role} with this brief:`, '', text].join('\n')
 }
 
 /** Gives every queued task that can start a worker: an idle one of its repo and role, or a new session. */
@@ -418,6 +469,18 @@ async function runCommand($: EngineInterface, args: string) {
       }
       return batch.length === 1 ? 'Task queued.' : `${batch.length} tasks queued.`
     }
+    case 'prompt': {
+      // Same batching as `task`; each request is rewritten by the model before it is queued.
+      const batch = rest.join(' ').split(/\s;;\s/).filter(part => part.trim())
+      if (batch.length === 0) {
+        return 'Usage: /orch prompt <repo> <request> [@role] [model:… effort:…] [;; <repo> <request>…]'
+      }
+      const answers: string[] = []
+      for (const part of batch) {
+        answers.push(await serial(() => upgradeTask($, part)))
+      }
+      return answers.join('\n\n')
+    }
     case 'retry':
       await serial(() => retryTask($, id, rest.slice(1).join(' ')))
       return `Task #${id} sent back to its worker.`
@@ -429,7 +492,7 @@ async function runCommand($: EngineInterface, args: string) {
       return 'Idle workers stopped.'
     default:
       if (rest.length === 0) {
-        return 'Usage: /orch [task <repo> <description> [@role] [;; <repo> <description>…] | retry <id> [note] | drop <id> | stop-idle | <session> <message>]'
+        return 'Usage: /orch [task <repo> <description> [@role] [;; …] | prompt <repo> <request> [@role] [;; …] | retry <id> [note] | drop <id> | stop-idle | <session> <message>]'
       }
       await send($, verb, rest.join(' '))
       return `Sent to ${verb}.`
@@ -440,7 +503,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'orch',
-      description: 'Orchestra: `task <repo> <description> [@role]`, `retry <id> [note]`, `drop <id>`, `stop-idle`, `<session> <message>`',
+      description: 'Orchestra: `task <repo> <description> [@role]`, `prompt <repo> <request> [@role]` (brief written by the model first), `retry <id> [note]`, `drop <id>`, `stop-idle`, `<session> <message>`',
     })
     $.clock.every(REFRESH_MS, () => void refresh($))
     void refresh($)
@@ -581,7 +644,7 @@ export const register: Register = on => {
             </Box>
             <Box flexGrow={1}>
               <Text wrap="truncate-end" dimColor={!isChosen}>
-                {task.text}
+                {firstLine(task.text)}
               </Text>
             </Box>
           </Box>

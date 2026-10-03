@@ -129,6 +129,43 @@ export const parseSizing = (reply: string): Sizing | null => {
   }
 }
 
+/** The Prompt Manager's framework (cortex/agents/roles/prompt-manager.md), applied to a task before the workers see it. */
+export const UPGRADE_SYSTEM = [
+  'You are the Prompt Manager of a software team: the first reader of every request, who reframes it before a developer agent works on it in a background Claude Code session.',
+  'The developer only sees the brief you write, in its own session: it reads the repo, but not this conversation.',
+  'Analyse the request for clarity, completeness, ambiguity and contradictions. Then rewrite it as a brief, in the language the request was written in, in this order:',
+  '1. Objective (what and why, one or two lines) 2. Context (repo, area, current state, as far as the request says) 3. Task (precise, numbered steps when several) 4. Constraints (conventions, scope limits, what not to touch) 5. Done when (observable checks: tests, behaviour).',
+  'Keep every fact, identifier and Jira key of the request verbatim; never invent requirements, file names or data the request does not give. Where the request leaves a routine choice open, say which default the developer should take.',
+  'A request whose intent cannot be told, or that contradicts itself, is not forwarded: ask instead, with the fewest questions that would settle it.',
+  'Reply with JSON only, either {"status":"ready","title":"one line, 100 characters at most, the Jira key first when there is one","brief":"the brief, markdown, newlines as \\n"} or {"status":"unclear","questions":["…"]}.',
+].join('\n')
+
+export const upgradePrompt = (repo: string, role: string, text: string): string =>
+  `Repo: /app/${repo}\nDeveloper role: ${role} (its cortex role card is loaded in its session)\nRequest:\n${text}`
+
+export type Upgrade = { title: string; brief: string } | { questions: string[] }
+
+/** Reads the upgrade JSON the orchestrator's model replied, or null when it is not one. */
+export const parseUpgrade = (reply: string): Upgrade | null => {
+  const json = /\{[\s\S]*\}/.exec(reply)?.[0]
+  if (!json) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(json) as { status?: string; title?: string; brief?: string; questions?: unknown }
+    if (parsed.status === 'ready' && typeof parsed.title === 'string' && typeof parsed.brief === 'string' && parsed.brief.trim()) {
+      return { title: firstLine(parsed.title.trim()) || firstLine(parsed.brief.trim()), brief: parsed.brief.trim() }
+    }
+    if (parsed.status === 'unclear' && Array.isArray(parsed.questions)) {
+      const questions = parsed.questions.filter((q): q is string => typeof q === 'string' && q.trim() !== '')
+      return questions.length > 0 ? { questions } : null
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 export const agentName = (role: string): string => `orch-${role}`
 
 export const REVIEWER = 'orch-reviewer'
@@ -158,7 +195,7 @@ export const reviewerAgent = (): string => {
   return JSON.stringify({ [REVIEWER]: { description: 'Orchestrator reviewer', prompt } })
 }
 
-const firstLine = (text: string): string => (text.split('\n')[0] ?? '').slice(0, 100)
+export const firstLine = (text: string): string => (text.split('\n')[0] ?? '').slice(0, 100)
 
 export const workerBrief = (self: string, task: Task): string =>
   [

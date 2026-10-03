@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 
 import { parseBackgrounded, parseListing } from '../hooks/parse'
 import { dollars, fillBar, toUsage } from '../hooks/usage'
-import { atLeast, parseNeeds, parseOverrides, parseSizing, parseVerdict, plan, roleFor } from '../hooks/pipeline'
+import { atLeast, parseNeeds, parseOverrides, parseSizing, parseUpgrade, parseVerdict, plan, roleFor } from '../hooks/pipeline'
 import type { Task, Worker } from '../types'
 
 const LISTING = [
@@ -114,7 +114,7 @@ test('development is floored at opus, effort kept', async () => {
 })
 
 /** Answers what the orchestrator runs: git for the base, claude to start and stop sessions. */
-const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING)) => {
+const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), replyFor: (e: { system?: string; prompt: string }) => string | null = () => sizingReply) => {
   const launched: { name: string; agent: string; model: string; effort: string; prompt: string }[] = []
   const asked: { model: string; prompt: string }[] = []
   const stopped: string[] = []
@@ -129,11 +129,12 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING)) => {
   on('tool.call', { tool: 'ListAgents' }, () => ({ result: { listing: LISTING } }))
   on('model.complete', (_$, e) => {
     asked.push({ model: e.model, prompt: e.prompt })
+    const reply = replyFor(e)
     return {
       value:
-        sizingReply === null
+        reply === null
           ? { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' }
-          : { isAnswered: true, text: sizingReply, usage: { input_tokens: 1, output_tokens: 1 } },
+          : { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } },
     } as never
   })
   on('session.send', (_$, e) => {
@@ -390,4 +391,64 @@ test('the pane shows each session context, tokens and cost, and keeps retired on
   await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
   expect(await ui.find({ type: 'Text', text: /\+ 1 retired session · \$0\.\d\d/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Σ \$\d+\.\d\d/ })).toBeDefined()
+})
+
+test('reads the Prompt Manager reply: a brief, questions, or nothing', async () => {
+  expect(parseUpgrade('Sure:\n{"status":"ready","title":"BLUSPARK-7300 fix the export","brief":"## Objective\\nExport works."}')).toEqual({
+    title: 'BLUSPARK-7300 fix the export',
+    brief: '## Objective\nExport works.',
+  })
+  expect(parseUpgrade('{"status":"unclear","questions":["Which export?",""]}')).toEqual({ questions: ['Which export?'] })
+  expect(parseUpgrade('{"status":"ready","title":"x","brief":"  "}')).toBeNull()
+  expect(parseUpgrade('{"status":"unclear","questions":[]}')).toBeNull()
+  expect(parseUpgrade('no json here')).toBeNull()
+})
+
+const BRIEF = { status: 'ready', title: 'BLUSPARK-7300 fix the CSV export of issues', brief: '## Objective\nThe CSV export of issues must include every column.\n\n## Done when\nphpunit export suite green.' }
+const upgradeOrSize = (e: { system?: string; prompt: string }) => (e.system?.includes('Prompt Manager') ? JSON.stringify(BRIEF) : JSON.stringify(SIZING))
+
+test('/orch prompt has the model write the brief, then queues and sizes that brief', async ($, on) => {
+  const { launched, asked } = world(on, JSON.stringify(SIZING), upgradeOrSize)
+  const ran = await orch($, 'prompt core/bluspark-backend BLUSPARK-7300 fix the export @tech-writer model:sonnet effort:low')
+
+  // 1st call: the upgrade, on the orchestrator model, with the request as typed, role and overrides stripped.
+  expect(asked[0]?.model).toBe('fable')
+  expect(asked[0]?.prompt).toContain('Request:\nBLUSPARK-7300 fix the export')
+  expect(asked[0]?.prompt).toContain('Developer role: tech-writer')
+  expect(asked[0]?.prompt).not.toContain('model:')
+  // 2nd call: the sizing, on the brief.
+  expect(asked[1]?.prompt).toContain('Role: tech-writer')
+  expect(asked[1]?.prompt).toContain('Task: BLUSPARK-7300 fix the CSV export of issues')
+
+  // The worker gets the brief, under the forced setting (sonnet raised to the floor) and role.
+  expect(launched[0]).toMatchObject({ agent: 'orch-tech-writer', model: 'opus', effort: 'low' })
+  expect(launched[0]?.prompt).toContain('round 1] BLUSPARK-7300 fix the CSV export of issues')
+  expect(launched[0]?.prompt).toContain('## Done when\nphpunit export suite green.')
+  expect(launched[0]?.prompt).not.toContain('Task: BLUSPARK-7300 fix the export\n')
+
+  // The person sees what was sent.
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #1 queued in core/bluspark-backend for tech-writer') })
+  expect(ran).toMatchObject({ text: expect.stringContaining('## Objective') })
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBe('● working')
+})
+
+test('/orch prompt on an unclear request asks instead of queuing', async ($, on) => {
+  const { launched, asked } = world(on, JSON.stringify(SIZING), e =>
+    e.system?.includes('Prompt Manager') ? JSON.stringify({ status: 'unclear', questions: ['Which export: CSV or PDF?', 'Jira key?'] }) : JSON.stringify(SIZING),
+  )
+  const ran = await orch($, 'prompt core/bluspark-backend fix the export')
+  expect(asked).toHaveLength(1)
+  expect(launched).toHaveLength(0)
+  expect(ran).toMatchObject({ text: expect.stringContaining('- Which export: CSV or PDF?') })
+  expect(ran).toMatchObject({ text: expect.stringContaining('- Jira key?') })
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBeUndefined()
+})
+
+test('/orch prompt queues nothing when the model does not answer', async ($, on) => {
+  const { launched } = world(on, null)
+  const ran = await orch($, 'prompt core/bluspark-backend BLUSPARK-7300 fix the export')
+  expect(launched).toHaveLength(0)
+  expect(ran).toMatchObject({ text: expect.stringContaining('nothing queued') })
 })
