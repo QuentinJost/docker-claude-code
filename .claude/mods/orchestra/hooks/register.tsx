@@ -1039,6 +1039,31 @@ export const register: Register = on => {
       )
     }
 
+    // Column labels on their own row, with the same widths as the cells, so they sit above their data.
+    const sessionColumns = (
+      <Box key="worker-columns">
+        <Box width={2} flexShrink={0} />
+        <Box flexGrow={1}>
+          <Text dimColor>session</Text>
+        </Box>
+        <Box width={14} flexShrink={0}>
+          <Text dimColor>model</Text>
+        </Box>
+        <Box width={10} flexShrink={0}>
+          <Text dimColor>status</Text>
+        </Box>
+        <Box width={11} flexShrink={0}>
+          <Text dimColor>context</Text>
+        </Box>
+        <Box width={8} flexShrink={0}>
+          <Text dimColor>tokens</Text>
+        </Box>
+        <Box width={8} flexShrink={0}>
+          <Text dimColor>est. $</Text>
+        </Box>
+      </Box>
+    )
+
     const orchestratorRow = (
       <Box key="worker-self">
         <Text color="cyan">◆ </Text>
@@ -1136,7 +1161,8 @@ export const register: Register = on => {
           </Box>
         </Section>
         {detail}
-        <Section title="Sessions" right={`context · tokens · est. cost · ${others.length} other · x stop idle · r refresh`}>
+        <Section title="Sessions" right={`${others.length} other · x stop idle · r refresh`}>
+          {sessionColumns}
           {orchestratorRow}
           {workerRows.length === 0 ? <Text dimColor>No worker launched yet.</Text> : workerRows}
           {retired.length > 0 && (
