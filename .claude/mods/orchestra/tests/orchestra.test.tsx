@@ -2,9 +2,9 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { parseBackgrounded, parseListing } from '../hooks/parse'
+import { deliveryFailure, isAutoModeHold, parseBackgrounded, parseListing } from '../hooks/parse'
 import { dollars, fillBar, toUsage } from '../hooks/usage'
-import { atLeast, parseNeeds, parseOverrides, parseSizing, parseUpgrade, parseVerdict, plan, roleFor } from '../hooks/pipeline'
+import { SIZING_SYSTEM, atLeast, hasJira, parseRouting, parseNeeds, parseOverrides, parseSizing, parseStatus, parseUpgrade, parseVerdict, plan, reviewBrief, roleFor, upgradePrompt, workerBrief } from '../hooks/pipeline'
 import type { Task, Worker } from '../types'
 
 const LISTING = [
@@ -68,6 +68,21 @@ test('picks the role from the repo, or from @role', async () => {
   expect(roleFor('core/bluspark-backend', 'mail @nobody').role).toBe('lead-backend')
 })
 
+test('a repo without Jira never asks for a key', async () => {
+  const task = { id: 7, repo: 'datalodestar', text: 'bulk delete', branchFrom: 'main', round: 1, report: '', reviews: [] } as unknown as Task
+  expect(hasJira('datalodestar')).toBe(false)
+  expect(workerBrief('orch', task)).not.toContain('BLUSPARK')
+  expect(workerBrief('orch', task)).toContain('git switch -c <branch> main')
+  expect(reviewBrief('orch', task)).toContain('no Jira project')
+  expect(upgradePrompt('datalodestar', 'lead-backend', 'x')).toContain('no Jira project')
+
+  const bluspark = { ...task, repo: 'core/bluspark' } as Task
+  expect(hasJira('core/bluspark')).toBe(true)
+  expect(workerBrief('orch', bluspark)).toContain('BLUSPARK-<n>')
+  expect(reviewBrief('orch', bluspark)).not.toContain('no Jira project')
+  expect(upgradePrompt('core/bluspark', 'lead-backend', 'x')).not.toContain('no Jira project')
+})
+
 test('reads a verdict and its findings', async () => {
   expect(parseVerdict(from('r', 'VERDICT: CHANGES_REQUESTED\nFINDINGS:\n- 🔴 a.php:3 — x — y'))).toEqual({
     isApproved: false,
@@ -75,6 +90,9 @@ test('reads a verdict and its findings', async () => {
   })
   expect(parseVerdict(from('r', 'VERDICT: APPROVED\nFINDINGS:\n'))?.isApproved).toBe(true)
   expect(parseVerdict(from('r', 'looks fine'))).toBeNull()
+  // As a real reviewer wrote it on 2026-10-03: the verdict on the same line as its prefix, never repeated.
+  expect(parseVerdict(from('r', '[task #2 · round 1] VERDICT: APPROVED\nFINDINGS:\n- ⚪ a.ts:1 — x'))).toEqual({ isApproved: true, findings: '- ⚪ a.ts:1 — x' })
+  expect(parseStatus('[task #2 · round 1] STATUS: blocked — no Jira key')).toBe('blocked')
 })
 
 test('keeps the question a report leaves for the person', async () => {
@@ -113,7 +131,17 @@ test('development is floored at opus, effort kept', async () => {
   expect(atLeast({ model: 'fable', effort: 'xhigh' }, 'opus')).toEqual({ model: 'fable', effort: 'xhigh' })
 })
 
+/** What SendMessage answers for a name it cannot reach, as a plugin's `$.tool.call` saw it on 2026-10-03. */
+const unreachable = (name: string) => ({
+  success: false,
+  message: `No agent named '${name}' is reachable.\nUse ListAgents to see everyone you can message.`,
+  display: `Not sent — no agent named '${name}' is reachable.`,
+})
+
 /** Answers what the orchestrator runs: git for the base, claude to start and stop sessions. */
+const AUTO_MODE_HOLD =
+  'The server-side auto mode classifier gave no verdict for SendMessage: the request that produced this action did not ask for one. Issue the action again once, as-is.'
+
 const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), replyFor: (e: { system?: string; prompt: string }) => string | null = () => sizingReply) => {
   const launched: { name: string; agent: string; model: string; effort: string; prompt: string }[] = []
   const asked: { model: string; prompt: string }[] = []
@@ -122,11 +150,21 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
   let ids = 0
   let python: (argv: readonly string[]) => string = () => '{}'
 
-  mock.clock(on, { now: Date.UTC(2026, 9, 3, 10, 0) })
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 10, 0) })
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', () => ({ value: undefined }))
   on('session.receive', (_$, e) => ({ text: e.text }))
-  on('tool.call', { tool: 'ListAgents' }, () => ({ result: { listing: LISTING } }))
+  // Like the real ones: ListAgents lists the sessions launched and still running, and SendMessage
+  // cannot reach the others. `kill` stands for the daemon stopping an idle session.
+  const running = new Map<string, string>()
+  const others = parseListing(LISTING).peers.map(p => p.name)
+  // Every message the orchestrator tried to send, delivered or not.
+  const tried: string[] = []
+  on('tool.call', { tool: 'ListAgents' }, () => ({
+    result: {
+      listing: [LISTING, ...[...running].map(([name, id]) => `  ${name} [${id.slice(-6)}]  ·  bg  ·  idle  ·  started 1m ago`)].join('\n'),
+    },
+  }))
   on('model.complete', (_$, e) => {
     asked.push({ model: e.model, prompt: e.prompt })
     const reply = replyFor(e)
@@ -137,9 +175,40 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
           : { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } },
     } as never
   })
-  on('session.send', (_$, e) => {
-    sent.push({ to: e.to, text: e.text })
-    return { isDelivered: true }
+  // Briefs go through the SendMessage tool (the idle subscription rides on it); a call
+  // without a message is the subscription alone and is not a delivery.
+  const watched: string[] = []
+  let refuse: string | null = null
+  let holds = 0
+  const submitted: string[] = []
+  on('prompt.submit', (_$, e) => {
+    if (e.origin.kind === 'plugin') {
+      submitted.push(e.text)
+    }
+    return { text: e.text }
+  })
+  on('tool.call', { tool: 'SendMessage' }, (_$, e) => {
+    const to = String(e.to)
+    if (e.message) {
+      tried.push(to)
+    }
+    if (e.message && holds > 0) {
+      holds -= 1
+      return { deny: AUTO_MODE_HOLD } as never
+    }
+    if (!running.has(to) && !others.includes(to)) {
+      return { result: unreachable(to) }
+    }
+    if (refuse !== null) {
+      return { result: { success: false, message: refuse } }
+    }
+    if (e.notify_when_idle) {
+      watched.push(to)
+    }
+    if (e.message) {
+      sent.push({ to, text: String(e.message) })
+    }
+    return { result: { success: true } }
   })
   on('process.run', (_$, e) => {
     const [cmd, sub, ...rest] = e.argv
@@ -153,14 +222,42 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
       const flag = (name: string) => rest[rest.indexOf(name) + 1] ?? ''
       const name = flag('-n')
       launched.push({ name, agent: flag('--agent'), model: flag('--model'), effort: flag('--effort'), prompt: rest.at(-1) ?? '' })
-      stdout = `backgrounded · ${String(ids).padStart(8, '0')} · ${name}\n`
+      const id = String(ids).padStart(8, '0')
+      running.set(name, id)
+      stdout = `backgrounded · ${id} · ${name}\n`
     } else if (cmd === 'claude' && sub === 'stop') {
       stopped.push(rest[0] ?? '')
+      for (const [name, id] of running) {
+        if (id === rest[0]) {
+          running.delete(name)
+        }
+      }
     }
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 
-  return { launched, stopped, sent, asked, onPython: (answer: typeof python) => { python = answer } }
+  return {
+    launched,
+    stopped,
+    sent,
+    tried,
+    watched,
+    asked,
+    clock,
+    submitted,
+    holdSends: (count: number) => {
+      holds = count
+    },
+    onPython: (answer: typeof python) => {
+      python = answer
+    },
+    refuseSends: (reason: string | null) => {
+      refuse = reason
+    },
+    kill: (name: string) => {
+      running.delete(name)
+    },
+  }
 }
 
 const orch = async ($: Parameters<TestBody>[0], args: string) =>
@@ -205,7 +302,12 @@ test('dispatches, reviews, reworks, approves and reuses the worker', async ($, o
   await receive($, 'orch-lead-backend-bluspark-backend', 'STATUS: done\nSUMMARY: test added')
   expect(launched[3]?.name).toBe('orch-review-1-r2')
   expect(launched[3]?.prompt).toContain('Round 1:')
-  await receive($, 'orch-review-1-r2', 'VERDICT: APPROVED\nFINDINGS:\n')
+  // The approval is the one report the model is handed, as a digest to write up for the person.
+  const approved = await receive($, 'orch-review-1-r2', 'VERDICT: APPROVED\nFINDINGS:\n- ⚪ Export.php:40 — long line — optional')
+  expect(approved).toMatchObject({ text: expect.stringContaining('[ORCH app-22] Task #1 approved at round 2 in core/bluspark-backend: BLUSPARK-7300 fix the export') })
+  expect((approved as { text: string }).text).toContain('SUMMARY: test added')
+  expect((approved as { text: string }).text).toContain('Export.php:40')
+  expect((approved as { text: string }).text).toContain('Write this up for the person')
 
   // Approved tasks are folded away until `a` shows them.
   expect(await stateOf(ui, 1)).toBeUndefined()
@@ -256,9 +358,21 @@ test('a blocked report waits for the person', async ($, on) => {
   expect(await stateOf(ui, 1)).toBeUndefined()
 })
 
+test('a blocked task whose worker reports done anyway goes to review', async ($, on) => {
+  const { launched } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar bulk delete')
+  await receive($, worker, 'STATUS: blocked\nNEEDS: a Jira key')
+  // Unblocked outside the pipeline, the worker reports straight away.
+  await receive($, worker, 'STATUS: done\nSUMMARY: bulk delete added')
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).not.toBe('⏸ blocked')
+  expect(launched.at(-1)?.name).toBe('orch-review-1-r1')
+  expect(launched.at(-1)?.prompt).toContain('SUMMARY: bulk delete added')
+})
+
 test('a local peer report, which arrives as a submitted prompt, drives the pipeline and is dropped', async ($, on) => {
   const { launched } = world(on)
-  on('prompt.submit', (_$, e) => ({ text: e.text }))
   await orch($, 'task core/bluspark-backend BLUSPARK-7300 fix the export')
 
   // As in the real run: framed by the engine, origin peer.
@@ -268,6 +382,12 @@ test('a local peer report, which arrives as a submitted prompt, drives the pipel
     wait: false,
   })
   expect(submitted).toEqual({ drop: 'orchestra: orch-lead-backend-bluspark-backend report handled by the pipeline' })
+  const approved = await $.prompt.submit({
+    text: `Another Claude session sent a message:\n${from('orch-review-1-r1', '[task #1 · round 1] VERDICT: APPROVED\nFINDINGS:\n')}`,
+    origin: { kind: 'peer' },
+    wait: false,
+  })
+  expect(approved).toMatchObject({ text: expect.stringContaining('Task #1 approved at round 1') })
   expect(launched.at(-1)?.name).toBe('orch-review-1-r1')
 
   // The same report through the other door moves nothing twice.
@@ -451,4 +571,325 @@ test('/orch prompt queues nothing when the model does not answer', async ($, on)
   const ran = await orch($, 'prompt core/bluspark-backend BLUSPARK-7300 fix the export')
   expect(launched).toHaveLength(0)
   expect(ran).toMatchObject({ text: expect.stringContaining('nothing queued') })
+})
+
+const REPOS = [
+  { repo: 'core/bluspark-backend', about: 'API REST cœur métier Bluspark' },
+  { repo: 'core/bluspark-frontend', about: 'PWA Bluspark' },
+  { repo: 'datalodestar', about: 'Graphical database client' },
+]
+
+/** The world's python answers the repo listing; the model routes with `route`, then sizes. */
+const routedWorld = (on: On, route: unknown) => {
+  const w = world(on, JSON.stringify(SIZING), e => (e.system?.includes('pick where the work happens') ? JSON.stringify(route) : JSON.stringify(SIZING)))
+  w.onPython(argv => (String(argv[1]).endsWith('/repos.py') ? JSON.stringify(REPOS) : '{}'))
+  return w
+}
+
+test('reads the routing reply: tasks on listed repos only, or questions', async () => {
+  const ok = parseRouting(JSON.stringify({ status: 'ready', tasks: [{ repo: 'datalodestar', title: 'T', brief: 'B' }] }), REPOS)
+  expect(ok).toEqual({ tasks: [{ repo: 'datalodestar', title: 'T', brief: 'B' }] })
+  // A task on a repo that is not listed spoils the whole answer: nothing half-queued.
+  expect(parseRouting(JSON.stringify({ status: 'ready', tasks: [{ repo: 'datalodestar', brief: 'B' }, { repo: 'nowhere', brief: 'B' }] }), REPOS)).toBeNull()
+  expect(parseRouting(JSON.stringify({ status: 'unclear', questions: ['Which repo?'] }), REPOS)).toEqual({ questions: ['Which repo?'] })
+  expect(parseRouting('no json', REPOS)).toBeNull()
+})
+
+test('/orch prompt without a repo: the model picks it, one task per repo', async ($, on) => {
+  const { launched, asked } = routedWorld(on, {
+    status: 'ready',
+    tasks: [
+      { repo: 'core/bluspark-backend', title: 'BLUSPARK-7400 add the field to the API', brief: 'back brief' },
+      { repo: 'core/bluspark-frontend', title: 'BLUSPARK-7400 show the field', brief: 'front brief' },
+    ],
+  })
+  const ran = await orch($, 'prompt BLUSPARK-7400 show the collection day on the issue page model:opus')
+
+  expect(asked[0]?.prompt).toContain('- core/bluspark-backend — API REST cœur métier Bluspark')
+  expect(asked[0]?.prompt).toContain('- datalodestar — Graphical database client (no Jira project)')
+  expect(asked[0]?.prompt).toContain('Request:\nBLUSPARK-7400 show the collection day on the issue page')
+  expect(asked[0]?.prompt).not.toContain('model:')
+  expect(launched.map(l => [l.name, l.agent])).toEqual([
+    ['orch-lead-backend-bluspark-backend', 'orch-lead-backend'],
+    ['orch-lead-frontend-bluspark-frontend', 'orch-lead-frontend'],
+  ])
+  expect(launched[1]?.prompt).toContain('Repo: /app/core/bluspark-frontend')
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #2 queued in core/bluspark-frontend for lead-frontend') })
+})
+
+test('/orch prompt without a repo keeps a role the person named', async ($, on) => {
+  const { launched } = routedWorld(on, { status: 'ready', tasks: [{ repo: 'datalodestar', title: 'Document bulk delete', brief: 'doc brief' }] })
+  await orch($, 'prompt document the bulk delete @tech-writer')
+  expect(launched[0]?.agent).toBe('orch-tech-writer')
+})
+
+test('/orch prompt without a repo queues nothing when the model cannot place it', async ($, on) => {
+  const { launched } = routedWorld(on, { status: 'unclear', questions: ['This is about the running stack, not a repo: which one?'] })
+  const ran = await orch($, 'prompt reindex OpenSearch')
+  expect(launched).toHaveLength(0)
+  expect(ran).toMatchObject({ text: expect.stringContaining('- This is about the running stack') })
+})
+
+test('/orch prompt naming a listed repo is not routed', async ($, on) => {
+  const { asked } = routedWorld(on, { status: 'ready', tasks: [] })
+  await orch($, 'prompt datalodestar fix the export')
+  expect(asked[0]?.prompt).toMatch(/^Repo: \/app\/datalodestar/)
+})
+
+test('a task on the stack runs without git, and its review checks the stack', async ($, on) => {
+  const { launched, sent } = world(on)
+  await orch($, 'task stack reindex the dev_container alias in OpenSearch')
+
+  const worker = 'orch-platform-engineer-stack'
+  expect(launched[0]).toMatchObject({ name: worker, agent: 'orch-platform-engineer' })
+  expect(launched[0]?.prompt).toContain('Target: the running local Bluspark stack, working from /app')
+  expect(launched[0]?.prompt).toContain('no branch, no commit')
+  expect(launched[0]?.prompt).toContain('how to undo it')
+  expect(launched[0]?.prompt).not.toContain('git switch')
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBe('● working')
+
+  await receive($, worker, 'STATUS: done\nSUMMARY: reindexed\nCHANGES: populate run\nTESTS: _count = 773k')
+  const review = launched.at(-1)
+  expect(review?.name).toBe('orch-review-1-r1')
+  expect(review?.prompt).toContain('there is no diff')
+  expect(review?.prompt).toContain('read-only commands only')
+  expect(review?.prompt).not.toContain('git -C')
+
+  // A rejection goes back with the stack's rules, not the branch's.
+  await receive($, 'orch-review-1-r1', 'VERDICT: CHANGES_REQUESTED\nFINDINGS:\n- 🔴 _count — 12 docs, not 773k — reindex again')
+  expect(sent.at(-1)?.text).toContain('Target: the running local stack, from /app')
+  expect(sent.at(-1)?.text).toContain('local stack only')
+  expect(sent.at(-1)?.text).not.toContain('task branch')
+})
+
+test('an approved stack task tells the person what changed, not a branch', async ($, on) => {
+  world(on)
+  const worker = 'orch-platform-engineer-stack'
+  await orch($, 'task stack restart the php-back container')
+  await receive($, worker, 'STATUS: done\nSUMMARY: restarted')
+  const digest = await $.prompt.submit({
+    text: `Another Claude session sent a message:\n${from('orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')}`,
+    origin: { kind: 'peer' },
+    wait: false,
+  })
+  expect(digest).toMatchObject({ text: expect.stringContaining('no branch, no commit') })
+  expect(digest).toMatchObject({ text: expect.stringContaining('how to undo it') })
+})
+
+test('/orch prompt without a repo may route to the stack', async ($, on) => {
+  const { launched, asked } = routedWorld(on, { status: 'ready', tasks: [{ repo: 'stack', title: 'Reindex OpenSearch locally', brief: 'ops brief' }] })
+  await orch($, 'prompt réindexe OpenSearch en local')
+  expect(asked[0]?.prompt).toContain('- stack — the running local Bluspark stack, no git')
+  expect(launched[0]?.name).toBe('orch-platform-engineer-stack')
+  expect(launched[0]?.prompt).toContain('Target: the running local Bluspark stack')
+})
+
+test('retry answers a blocked worker and tells whether it was delivered', async ($, on) => {
+  const { sent, watched, refuseSends } = world(on)
+  await orch($, 'task datalodestar delete a database from the listing')
+  const worker = 'orch-lead-backend-datalodestar'
+  expect(watched).toEqual([worker])
+  await receive($, worker, 'STATUS: blocked\nNEEDS: the Jira key')
+
+  // Not waiting: said so, nothing sent.
+  const before = sent.length
+  expect(await orch($, 'retry 7 x')).toMatchObject({ text: expect.stringContaining('no such task') })
+  expect(sent).toHaveLength(before)
+
+  // A delivery that fails leaves the task blocked and says why.
+  refuseSends('held for approval')
+  expect(await orch($, 'retry 1 no Jira key here')).toMatchObject({ text: expect.stringContaining('not sent back to orch-lead-backend-datalodestar: held for approval') })
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBe('⏸ blocked')
+
+  // Delivered: the answer goes as its own brief, watched, and the task works again.
+  refuseSends(null)
+  expect(await orch($, 'retry 1 no Jira key, branch feat/delete-db')).toMatchObject({ text: `Task #1 sent back to ${worker}.` })
+  expect(sent.at(-1)?.to).toBe(worker)
+  expect(sent.at(-1)?.text).toContain('The person answered: no Jira key, branch feat/delete-db')
+  expect(sent.at(-1)?.text).not.toContain('Review rejected')
+  expect(watched.at(-1)).toBe(worker)
+  expect(await stateOf(ui, 1)).toBe('● working')
+  expect(await orch($, 'retry 1 again')).toMatchObject({ text: expect.stringContaining('it is working, not waiting for you') })
+})
+
+test('a free-form message goes only to a session that exists, and reports its delivery', async ($, on) => {
+  const { sent, refuseSends } = world(on)
+  expect(await orch($, 'dont use jira keys')).toMatchObject({ text: expect.stringContaining('No session named "dont"') })
+  expect(sent).toHaveLength(0)
+  expect(await orch($, 'app-71 hello')).toMatchObject({ text: 'Sent to app-71.' })
+  expect(sent.at(-1)).toEqual({ to: 'app-71', text: 'hello' })
+  refuseSends('nobody by that name')
+  expect(await orch($, 'app-71 hello again')).toMatchObject({ text: 'Not delivered to app-71: nobody by that name' })
+})
+
+test('a session idle without its report gets its brief again, then the person decides', async ($, on) => {
+  const { sent, clock, launched } = world(on)
+  await orch($, 'task datalodestar BLUSPARK-7400 delete a database')
+  const worker = 'orch-lead-backend-datalodestar'
+  const idle = (name: string) =>
+    $.session.receive({ origin: { kind: 'peer' }, text: `[Cross-session idle notice] "${name}", which you asked to be notified about, is idle now.` })
+
+  // Idle, no report within the grace: the launch brief goes again, in full.
+  await idle(worker)
+  expect(sent).toHaveLength(0)
+  await clock.advance(20_000)
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.to).toBe(worker)
+  expect(sent[0]?.text).toContain('You went idle without reporting')
+  expect(sent[0]?.text).toContain(launched[0]?.prompt ?? 'x')
+
+  // Idle again, still silent: blocked for the person.
+  await idle(worker)
+  await clock.advance(20_000)
+  expect(sent).toHaveLength(1)
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBe('⏸ blocked')
+  expect(await ui.find({ type: 'Text', text: /idle twice without reporting/ })).toBeDefined()
+
+  // A report that arrives before the grace ends is the normal case: nothing is resent.
+  await orch($, 'retry 1 go on')
+  expect(sent).toHaveLength(2)
+  await idle(worker)
+  await receive($, worker, 'STATUS: done\nSUMMARY: done')
+  await clock.advance(20_000)
+  expect(sent).toHaveLength(2)
+  expect(launched.filter(l => l.agent === 'orch-reviewer')).toHaveLength(1)
+})
+
+test('reads what SendMessage answers: success false, a refusal or an error delivers nothing', async () => {
+  // As a plugin's $.tool.call saw an unreachable name on 2026-10-03: neither deny nor isError.
+  const seen = { result: unreachable('orch-x'), text: JSON.stringify({ success: false, message: unreachable('orch-x').message }) }
+  expect(deliveryFailure(seen)).toBe("No agent named 'orch-x' is reachable.")
+  expect(deliveryFailure({ text: seen.text })).toBe("No agent named 'orch-x' is reachable.")
+  expect(deliveryFailure({ result: { success: false } })).toBe('not delivered')
+  expect(deliveryFailure({ result: { success: true, message: 'sent' } })).toBeNull()
+  expect(deliveryFailure({ deny: 'held for approval' })).toBe('held for approval')
+  expect(deliveryFailure({ isError: true, text: 'boom' })).toBe('boom')
+})
+
+test('tells an auto-mode hold from a refusal', async () => {
+  expect(isAutoModeHold(AUTO_MODE_HOLD)).toBe(true)
+  expect(isAutoModeHold("No agent named 'orch-x' is reachable.")).toBe(false)
+  expect(isAutoModeHold('held for approval')).toBe(false)
+})
+
+test('a retry the classifier holds once goes out on the second try', async ($, on) => {
+  const { sent, submitted, holdSends } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar bulk delete')
+  await receive($, worker, 'STATUS: blocked\nNEEDS: a Jira key')
+  holdSends(1)
+  expect((await orch($, 'retry 1 no jira ticket')).text).toBe(`Task #1 sent back to ${worker}.`)
+  expect(sent.at(-1)?.text).toContain('The person answered: no jira ticket')
+  expect(submitted).toEqual([])
+})
+
+test('a retry the classifier holds twice is handed to Claude, framed as the plugin\'s', async ($, on) => {
+  const { sent, submitted, holdSends, clock } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar bulk delete')
+  await receive($, worker, 'STATUS: blocked\nNEEDS: a Jira key')
+  const before = sent.length
+  holdSends(2)
+  expect((await orch($, 'retry 1 no jira ticket')).text).toBe(`Task #1 sent back to ${worker}.`)
+  expect(sent.length).toBe(before)
+  expect(submitted).toEqual([])
+  await clock.advance(100)
+  expect(submitted).toHaveLength(1)
+  expect(submitted[0]).toContain(`Send it with SendMessage to "${worker}", with notify_when_idle: true,`)
+  expect(submitted[0]).toContain('The person answered: no jira ticket')
+})
+
+test('an idle worker the daemon stopped is not reused: a fresh session takes the next task', async ($, on) => {
+  const { launched, stopped, sent, tried, kill } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar BLUSPARK-7401 first')
+  await receive($, worker, 'STATUS: done\nSUMMARY: done')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  expect(launched).toHaveLength(2)
+
+  // An hour later the daemon has stopped the idle worker, which the orchestrator still lists.
+  kill(worker)
+  expect(await orch($, `${worker} are you there`)).toMatchObject({ text: `Not delivered to ${worker}: No agent named '${worker}' is reachable.` })
+
+  const before = tried.length
+  await orch($, 'task datalodestar BLUSPARK-7402 second')
+  // Checked before use: no brief is even tried on the gone session.
+  expect(tried.slice(before)).toEqual([])
+  expect(stopped).toContain('00000001')
+  expect(launched).toHaveLength(3)
+  expect(launched[2]?.name).toBe(worker)
+  expect(launched[2]?.prompt).toMatch(/task #2 · round 1\] BLUSPARK-7402 second/)
+  expect(sent.filter(s => s.text.includes('task #2'))).toHaveLength(0)
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 2)).toBe('● working')
+})
+
+test('a reused worker that turns the brief down is replaced by a fresh session', async ($, on) => {
+  const { launched, stopped, refuseSends } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar BLUSPARK-7404 first')
+  await receive($, worker, 'STATUS: done')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+
+  refuseSends('this session takes no messages from other sessions')
+  await orch($, 'task datalodestar BLUSPARK-7405 second')
+  refuseSends(null)
+  expect(stopped).toContain('00000001')
+  expect(launched).toHaveLength(3)
+  expect(launched[2]?.name).toMatch(/^orch-lead-backend-datalodestar(-2)?$/)
+  expect(launched[2]?.prompt).toMatch(/task #2 · round 1\] BLUSPARK-7405 second/)
+})
+
+test('retry to a worker the daemon stopped hands the task to a fresh session, briefed in full', async ($, on) => {
+  const { launched, stopped, kill } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar delete several databases')
+  await receive($, worker, 'STATUS: blocked\nNEEDS: the Jira key')
+  kill(worker)
+
+  expect(await orch($, 'retry 1 no Jira key, branch feat/multi-delete')).toMatchObject({
+    text: `Task #1 handed to a fresh session, ${worker}, briefed in full: the previous one was gone.`,
+  })
+  expect(stopped).toContain('00000001')
+  expect(launched).toHaveLength(2)
+  const fresh = launched[1]?.prompt ?? ''
+  expect(fresh).toContain(`You take over this task: ${worker}, the session that worked on it, is gone.`)
+  expect(fresh).toContain('Rules:')
+  expect(fresh).toContain('The person answered: no Jira key, branch feat/multi-delete')
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 1)).toBe('● working')
+
+  // The fresh session's report moves the task on as any worker's does.
+  await receive($, worker, 'STATUS: done\nSUMMARY: done')
+  expect(launched.at(-1)?.name).toBe('orch-review-1-r1')
+})
+
+test("a rejected review's findings reach a fresh session when the worker is gone", async ($, on) => {
+  const { launched, kill } = world(on)
+  const worker = 'orch-lead-backend-datalodestar'
+  await orch($, 'task datalodestar BLUSPARK-7403 delete several databases')
+  await receive($, worker, 'STATUS: done\nSUMMARY: done')
+  kill(worker)
+  await receive($, 'orch-review-1-r1', 'VERDICT: CHANGES_REQUESTED\nFINDINGS:\n- 🟠 tree.ts:9 — no test — add one')
+
+  const fresh = launched.at(-1)
+  expect(fresh?.name).toBe(worker)
+  expect(fresh?.prompt).toContain('You take over this task')
+  expect(fresh?.prompt).toMatch(/task #1 · round 2\] Review rejected/)
+  expect(fresh?.prompt).toContain('tree.ts:9')
+  await receive($, worker, 'STATUS: done\nSUMMARY: test added')
+  expect(launched.at(-1)?.name).toBe('orch-review-1-r2')
+})
+
+test('no session runs on haiku: a review sized to haiku is raised to sonnet, effort kept', async ($, on) => {
+  const { launched } = world(on, JSON.stringify({ work: { model: 'haiku', effort: 'low' }, review: { model: 'haiku', effort: 'low' }, why: 'typo' }))
+  await orch($, 'task core/bluspark-backend BLUSPARK-7310 fix a typo')
+  expect(launched[0]).toMatchObject({ model: 'opus', effort: 'low' })
+  await receive($, 'orch-lead-backend-bluspark-backend', 'STATUS: done\nSUMMARY: typo fixed')
+  expect(launched[1]).toMatchObject({ name: 'orch-review-1-r1', model: 'sonnet', effort: 'low' })
+  expect(launched.map(l => l.model)).not.toContain('haiku')
+  expect(SIZING_SYSTEM).toContain('Haiku is never used.')
 })

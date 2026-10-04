@@ -31,7 +31,19 @@ export type Task = {
 }
 
 /** A background session this orchestrator launched; `task` is the one it holds, if any. */
-export type Worker = { name: string; bgId: string; repo: string; role: string; model: string; effort: string; task: number | null }
+export type Worker = {
+  name: string
+  bgId: string
+  repo: string
+  role: string
+  model: string
+  effort: string
+  task: number | null
+  /** The last brief sent to it, sent again once if it goes idle without reporting. */
+  brief?: string
+  /** How many times that brief went again. */
+  nudges?: number
+}
 
 /** What a session has consumed, read from its transcript; the cost is an estimate at API rates. */
 export type WorkerUsage = {

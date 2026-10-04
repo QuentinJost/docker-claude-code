@@ -26,8 +26,25 @@ const ROLE_BY_REPO: [RegExp, string][] = [
   [/frontend|design/i, 'lead-frontend'],
   [/e2e/i, 'qa-automation'],
   [/database/i, 'dba'],
-  [/^utils\/bluspark$|iac|infra/i, 'platform-engineer'],
+  [/^utils\/bluspark$|iac|infra|^stack$/i, 'platform-engineer'],
 ]
+
+/** Repos with no Jira project: no key to find or ask for, branches are `<type>/<slug>`. */
+export const NO_JIRA_REPOS = new Set(['datalodestar'])
+
+export const hasJira = (repo: string): boolean => !NO_JIRA_REPOS.has(repo)
+
+/**
+ * The target of operations work: the running local stack, from the workspace root, which is not
+ * a git repo. No branch, no commit: the worker acts on the stack and reports what it did, and the
+ * reviewer checks that report against the stack's real state.
+ */
+export const STACK = 'stack'
+
+export const isStack = (repo: string): boolean => repo === STACK
+
+/** Where a task's worker runs. */
+export const repoPath = (repo: string): string => (isStack(repo) ? '/app' : `/app/${repo}`)
 
 const ROLE_TAG = /(^|\s)@([a-z-]+)\b/
 
@@ -65,8 +82,16 @@ const isSetting = (value: unknown): value is Setting => {
   )
 }
 
-/** Development never runs on a model weaker than this one (the person's rule); reviews are not bound. */
+/** Development never runs on a model weaker than this one (the person's rule). */
 export const WORK_FLOOR = 'opus'
+
+/**
+ * No session the orchestrator launches runs on a model weaker than this one, reviews included
+ * (the person's rule, 2026-10-03: avoid haiku). A Haiku background session starts in the
+ * `default` permission mode, not `auto`, and waits for ever on its first approval: a reviewer
+ * sized to haiku hung that way on 2026-10-03.
+ */
+export const SESSION_FLOOR = 'sonnet'
 
 const RANK: readonly string[] = ['haiku', 'sonnet', 'opus', 'fable']
 
@@ -103,8 +128,8 @@ export const parseOverrides = (text: string): { text: string; work: Partial<Sett
 export const SIZING_SYSTEM = [
   'You size Claude Code sessions for an orchestrator. Each task runs in one development session, then each review round in a fresh reviewer session.',
   'Pick, for each, the cheapest model and effort that will do the job well; a failed review round costs more than a stronger first pass.',
-  'Models: fable (most capable, slowest, most expensive: ambiguous design, cross-cutting or risky changes), opus (strong default for real code changes), sonnet (well-specified routine changes, docs, small fixes), haiku (trivial mechanical edits only).',
-  `Development runs on ${WORK_FLOOR} or fable, never below ${WORK_FLOOR}: pick between those two and size the effort; the reviewer may use any model.`,
+  'Models: fable (most capable, slowest, most expensive: ambiguous design, cross-cutting or risky changes), opus (strong default for real code changes), sonnet (well-specified routine changes, docs, small fixes, light reviews). Haiku is never used.',
+  `Development runs on ${WORK_FLOOR} or fable, never below ${WORK_FLOOR}: pick between those two and size the effort; the reviewer runs on ${SESSION_FLOOR}, opus or fable.`,
   'Effort: low, medium, high, xhigh, max. Raise it for subtle logic, security, data migrations, concurrency, money; lower it for mechanical work.',
   'The reviewer must be able to catch what the developer can miss: never weaker than the development on a risky task.',
   'Reply with JSON only: {"work":{"model":"…","effort":"…"},"review":{"model":"…","effort":"…"},"why":"one short sentence"}',
@@ -141,7 +166,72 @@ export const UPGRADE_SYSTEM = [
 ].join('\n')
 
 export const upgradePrompt = (repo: string, role: string, text: string): string =>
-  `Repo: /app/${repo}\nDeveloper role: ${role} (its cortex role card is loaded in its session)\nRequest:\n${text}`
+  [
+    isStack(repo)
+      ? 'Target: the running local Bluspark stack (containers, databases, search indexes, proxy), from /app, which is not a git repo: operations work, no code change. Done-when checks are observable states of the stack.'
+      : `Repo: /app/${repo}${hasJira(repo) ? '' : ' (no Jira project: there is no key, never ask for one)'}`,
+    `Developer role: ${role} (its cortex role card is loaded in its session)`,
+    `Request:\n${text}`,
+  ].join('\n')
+
+/** One repo of the workspace, as hooks/repos.py lists it for routing. */
+export type RepoInfo = { repo: string; about: string }
+
+/** At most this many tasks come out of one routed request, one per repo. */
+export const MAX_ROUTED = 4
+
+/** `/orch prompt` without a repo: the Prompt Manager also picks where the work happens. */
+export const ROUTE_SYSTEM = [
+  ...UPGRADE_SYSTEM.split('\n').slice(0, -1),
+  'The request names no repo: you also pick where the work happens, among the git repositories listed (paths under /app). Read the workspace overview to know what each one is.',
+  `Work on the running local stack itself, with no code change in any repo (operating containers, data fixes in the local databases, reindexing, investigations, playtests), goes to the target "${STACK}".`,
+  'Pick the repo whose code the change lives in. Prefer a main checkout over a ticket worktree (a folder named after a ticket, e.g. backend-bluspark-7084) unless the request names that ticket; never pick a throwaway sandbox unless the request names it; never pick a repo marked as migrated or deprecated.',
+  `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED}); they run in parallel, so say in each brief what the other side does. A request you cannot place is not forwarded: ask instead.`,
+  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","title":"one line, 100 characters at most, the Jira key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
+].join('\n')
+
+export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: string | null, text: string): string =>
+  [
+    'Targets: the git repositories under /app, and the running stack:',
+    `- ${STACK} — the running local Bluspark stack, no git (operations, data fixes, investigations, playtests)`,
+    ...repos.map(r => `- ${r.repo}${r.about ? ` — ${r.about}` : ''}${hasJira(r.repo) ? '' : ' (no Jira project)'}`),
+    ...(overview ? ['', 'Workspace overview:', overview] : []),
+    '',
+    ...(role ? [`Developer role, named by the person: ${role}`] : []),
+    `Request:\n${text}`,
+  ].join('\n')
+
+export type Routed = { tasks: { repo: string; title: string; brief: string }[] } | { questions: string[] }
+
+/** Reads the routing JSON, keeping only tasks on a listed repo; null when it is not one. */
+export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed | null => {
+  const json = /\{[\s\S]*\}/.exec(reply)?.[0]
+  if (!json) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(json) as { status?: string; tasks?: unknown; questions?: unknown }
+    if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
+      const known = new Set([STACK, ...repos.map(r => r.repo)])
+      const tasks = parsed.tasks
+        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown })
+        .filter(t => typeof t.repo === 'string' && known.has(t.repo) && typeof t.brief === 'string' && t.brief.trim() !== '')
+        .map(t => {
+          const brief = String(t.brief).trim()
+          return { repo: String(t.repo), title: firstLine(typeof t.title === 'string' ? t.title.trim() : '') || firstLine(brief), brief }
+        })
+        .slice(0, MAX_ROUTED)
+      return tasks.length > 0 && tasks.length === Math.min(parsed.tasks.length, MAX_ROUTED) ? { tasks } : null
+    }
+    if (parsed.status === 'unclear' && Array.isArray(parsed.questions)) {
+      const questions = parsed.questions.filter((q): q is string => typeof q === 'string' && q.trim() !== '')
+      return questions.length > 0 ? { questions } : null
+    }
+    return null
+  } catch {
+    return null
+  }
+}
 
 export type Upgrade = { title: string; brief: string } | { questions: string[] }
 
@@ -197,16 +287,42 @@ export const reviewerAgent = (): string => {
 
 export const firstLine = (text: string): string => (text.split('\n')[0] ?? '').slice(0, 100)
 
+const branchRule = (task: Task): string => {
+  const from = task.branchFrom || 'the repo\'s current branch'
+  const start = task.branchFrom || 'HEAD'
+
+  return hasJira(task.repo)
+    ? `- Branch named after the Jira key of the task (BLUSPARK-<n>), created from ${from} (git switch -c <key> ${start}), never from another task's branch. No key in the task: report STATUS: blocked and ask for it.`
+    : `- This repo has no Jira project: never look for or ask for a ticket key. Branch named <type>/<short-slug> like the repo's existing branches (feat/…, fix/…, perf/…, chore/…), created from ${from} (git switch -c <branch> ${start}), never from another task's branch.`
+}
+
+const STACK_RULES = [
+  '- /app is not a git repo: no branch, no commit. Act on the running local stack (docker, the containers\' CLIs, local databases and indexes) as the task needs.',
+  '- Local stack only: never touch a remote, shared or production system (develop, preprod, prod, cloud consoles) and never push anything anywhere.',
+  '- Before anything that destroys or cannot be undone (dropping or truncating data, deleting volumes or images, rewriting a database), save what it would lose first, or report STATUS: blocked and ask in NEEDS.',
+  '- Keep a log of every command that changed something, and how to undo it. Check the outcome on the stack before reporting.',
+]
+
+const STACK_REPORT = [
+  'STATUS: done | blocked | failed',
+  'SUMMARY: <2-5 lines>',
+  'CHANGES: <every change made to the stack: command, effect, how to undo it>',
+  'TESTS: <the checks run on the stack and what they showed, with the commands so the reviewer can rerun them>',
+  'NEEDS: <decision required from the person, if any>',
+]
+
 export const workerBrief = (self: string, task: Task): string =>
-  [
+  isStack(task.repo) ? stackBrief(self, task) : [
     `[ORCH ${self} · task #${task.id} · round 1] ${firstLine(task.text)}`,
     '',
     `Repo: /app/${task.repo} (work only there)`,
     `Task: ${task.text}`,
     '',
     'Rules:',
-    `- Branch named after the Jira key of the task (BLUSPARK-<n>), created from ${task.branchFrom || 'the repo\'s current branch'} (git switch -c <key> ${task.branchFrom || 'HEAD'}), never from another task's branch. No key in the task: report STATUS: blocked and ask for it.`,
-    '- Commit locally with the project\'s git identity and subject format; never push.',
+    branchRule(task),
+    hasJira(task.repo)
+      ? '- Commit locally with the project\'s git identity and subject format; never push.'
+      : '- Commit locally with the project\'s git identity and subject format, without any ticket key; never push.',
     '- Run the relevant tests before reporting.',
     '',
     `When finished, reply via SendMessage to "${self}" with:`,
@@ -217,27 +333,108 @@ export const workerBrief = (self: string, task: Task): string =>
     'NEEDS: <decision required from the person, if any>',
   ].join('\n')
 
+const stackBrief = (self: string, task: Task): string =>
+  [
+    `[ORCH ${self} · task #${task.id} · round 1] ${firstLine(task.text)}`,
+    '',
+    'Target: the running local Bluspark stack, working from /app',
+    `Task: ${task.text}`,
+    '',
+    'Rules:',
+    ...STACK_RULES,
+    '',
+    `When finished, reply via SendMessage to "${self}" with:`,
+    ...STACK_REPORT,
+  ].join('\n')
+
+/** Where a task's work is, as the follow-up briefs say it. */
+const where = (task: Task): string => (isStack(task.repo) ? 'Target: the running local stack, from /app' : `Repo: /app/${task.repo}`)
+
+/** The rules a follow-up brief repeats. */
+const sameRules = (task: Task, tests: boolean): string =>
+  isStack(task.repo)
+    ? 'Same rules: local stack only, nothing destructive without a backup or the person\'s go-ahead, every change logged with how to undo it.'
+    : `Same rules: local commits on the task branch, never push${tests ? ', run the relevant tests' : ''}.`
+
 export const reworkBrief = (self: string, task: Task, findings: string): string =>
   [
     `[ORCH ${self} · task #${task.id} · round ${task.round}] Review rejected: fix and report again`,
     '',
-    `Repo: /app/${task.repo}`,
+    where(task),
     `Task: ${task.text}`,
     '',
     'Reviewer findings:',
     findings,
     '',
-    'Fix every 🔴 and 🟠 finding; answer the others in SUMMARY. Same rules: local commits on the task branch, never push.',
+    `Fix every 🔴 and 🟠 finding; answer the others in SUMMARY. ${sameRules(task, false)}`,
     `Reply via SendMessage to "${self}" with STATUS / SUMMARY / CHANGES / TESTS / NEEDS, as before.`,
   ].join('\n')
 
-export const reviewBrief = (self: string, task: Task): string =>
+/** The person's answer to a blocked worker: the task again, with the answer, same rules. */
+export const answerBrief = (self: string, task: Task, answer: string): string =>
   [
+    `[ORCH ${self} · task #${task.id} · round ${task.round}] ${answer}`,
+    '',
+    where(task),
+    `Task: ${task.text}`,
+    '',
+    `Go on with the task. ${sameRules(task, true)}`,
+    `Reply via SendMessage to "${self}" with STATUS / SUMMARY / CHANGES / TESTS / NEEDS, as before.`,
+  ].join('\n')
+
+/**
+ * What the orchestrator's own model is handed when a task is approved, so the person reads the
+ * outcome in Claude's ordinary output and not only in the pane: the facts, then what to do with them.
+ */
+export const doneDigest = (self: string, task: Task): string => {
+  const last = task.reviews.at(-1)
+  return [
+    `[ORCH ${self}] Task #${task.id} approved at round ${task.round} in ${task.repo}: ${firstLine(task.text)}`,
+    '',
+    isStack(task.repo)
+      ? 'Operations on the running local stack: no branch, no commit; the changes are in the worker report.'
+      : `Branch started from ${task.branchFrom || 'the repo\'s branch'} at ${task.base || '?'}; nothing was pushed.`,
+    '',
+    'Worker report:',
+    task.report || '(none)',
+    '',
+    `Reviewer findings (round ${last?.round ?? task.round}):`,
+    last?.findings || '(none)',
+    '',
+    `Write this up for the person, in their language: what was delivered and where (${isStack(task.repo) ? 'what changed in the stack and how to undo it' : 'branch, commits'}), what was tested, the reviewer's remaining remarks, and any open question in NEEDS. Report only: run no tool and change nothing.`,
+  ].join('\n')
+}
+
+/**
+ * The brief of a fresh session on a task whose worker is gone (the daemon stops a background
+ * session after an hour without a turn): the task as first briefed, then the latest message.
+ */
+export const takeoverBrief = (self: string, task: Task, previous: string, latest: string): string =>
+  [
+    `[ORCH ${self} · task #${task.id} · round ${task.round}] You take over this task: ${previous}, the session that worked on it, is gone.`,
+    isStack(task.repo)
+      ? 'Part of the work may already be done on the stack: check its current state first, and carry on from there rather than starting over.'
+      : `Its work may already be in /app/${task.repo}: check the branches and the task branch's commits first, and carry on from there rather than starting over.`,
+    '',
+    'The task as first briefed:',
+    '',
+    workerBrief(self, task),
+    '',
+    'The latest message for this task:',
+    '',
+    latest,
+  ].join('\n')
+
+export const reviewBrief = (self: string, task: Task): string =>
+  isStack(task.repo) ? stackReviewBrief(self, task) : [
     `[ORCH ${self} · review task #${task.id} · round ${task.round}] ${firstLine(task.text)}`,
     '',
     `Repo: /app/${task.repo}`,
     `Task: ${task.text}`,
     `Base: ${task.base || 'unknown'} (${task.branchFrom || 'current branch'}). Review everything since it: git -C /app/${task.repo} log ${task.base}..HEAD, git -C /app/${task.repo} diff ${task.base}, and any uncommitted change.`,
+    ...(hasJira(task.repo)
+      ? []
+      : ['This repo has no Jira project: no ticket key in the branch or commits, and the acceptance criteria are the brief\'s "Done when" list. Never raise a missing key as a finding.']),
     '',
     'Worker report:',
     task.report,
@@ -252,8 +449,33 @@ export const reviewBrief = (self: string, task: Task): string =>
     '- 🔴|🟠|⚪ <file:line> — <problem> — <expected fix>',
   ].join('\n')
 
-const STATUS = /^\s*STATUS:\s*(done|blocked|failed)\b/im
-const VERDICT = /^\s*VERDICT:\s*(APPROVED|CHANGES_REQUESTED)\b/im
+/** An operations task has no diff: the review checks the worker's report against the stack as it is. */
+const stackReviewBrief = (self: string, task: Task): string =>
+  [
+    `[ORCH ${self} · review task #${task.id} · round ${task.round}] ${firstLine(task.text)}`,
+    '',
+    'Target: the running local Bluspark stack, from /app (not a git repo: there is no diff, and the code-review workflow does not apply).',
+    `Task: ${task.text}`,
+    '',
+    'Review by checking the worker\'s claims against the stack itself, with read-only commands only (docker ps/inspect/logs, SELECT queries, index counts, HTTP GETs, rerunning its checks): is the task\'s "Done when" met, did each change listed take effect, is anything left broken or half-done, is every change undoable as it says, and did it stay on the local stack.',
+    'Raise as 🔴 a claim the stack contradicts, an unmet "Done when", or a destructive change made without a backup or go-ahead; as 🟠 a change missing from the report or with no way back.',
+    '',
+    'Worker report:',
+    task.report,
+    ...(task.reviews.length > 0
+      ? ['', 'Earlier rounds\' findings (check they are fixed):', ...task.reviews.map(r => `Round ${r.round}:\n${r.findings}`)]
+      : []),
+    '',
+    'Change nothing on the stack or anywhere else.',
+    `Reply via SendMessage to "${self}" with:`,
+    'VERDICT: APPROVED | CHANGES_REQUESTED',
+    'FINDINGS:',
+    '- 🔴|🟠|⚪ <what was checked> — <problem> — <expected fix>',
+  ].join('\n')
+
+// Anywhere in the text: a session often opens with `[task #n · round r] STATUS: done — …` on one line.
+const STATUS = /\bSTATUS:\s*(done|blocked|failed)\b/i
+const VERDICT = /\bVERDICT:\s*(APPROVED|CHANGES_REQUESTED)\b/i
 
 const strip = (text: string): string => text.replace(/<\/?cross-session-message[^>]*>/g, '\n')
 
