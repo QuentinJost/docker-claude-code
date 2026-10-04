@@ -2,7 +2,7 @@ services:
   claude-code:
     init: true
     build: .
-    container_name: claude-code
+    container_name: "${CONTAINER_NAME:-claude-code}"
     group_add:
       - "${DOCKER_GID:-999}"   # match host GID
     volumes:
