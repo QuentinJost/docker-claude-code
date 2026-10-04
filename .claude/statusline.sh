@@ -13,7 +13,7 @@ C_COST=$'\e[38;5;114m'      # green
 C_LIM=$'\e[38;5;245m'       # gray
 C_OK=$'\e[38;5;114m'        # green  (ctx < 50%)
 C_WARN=$'\e[38;5;221m'      # yellow (ctx < 80%)
-C_HOT=$'\e[38;5;203m'       # red    (ctx >= 80%)
+C_HOT=$'\e[38;2;204;76;76m'    # red #ff5f5f at 0.8 opacity over the black background (ctx >= 80%)
 DIMC=$'\e[38;5;240m'
 SEP="${DIMC}  ${RST}"
 
