@@ -44,18 +44,32 @@ limits=$(echo "$input" | jq -r '
    (.rate_limits.seven_day.used_percentage // empty | "7d \(.)%")] |
   join(" · ") | if . == "" then empty else . end')
 
+# Colors (ANSI, reset after each segment)
+C_RESET=$'\033[0m'
+C_DIR=$'\033[1;34m'     # bold blue
+C_GIT=$'\033[1;35m'     # bold magenta
+C_MODEL=$'\033[1;36m'   # bold cyan
+C_CTX=$'\033[33m'       # yellow
+C_COST=$'\033[32m'      # green
+C_LIMITS=$'\033[31m'    # red
+C_SEP=$'\033[90m'       # dim grey
+
+# Context colour shifts with usage: yellow < 70%, red >= 70%
+ctx_pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
+if [ "${ctx_pct%.*}" -ge 70 ] 2>/dev/null; then C_CTX=$'\033[1;31m'; fi
+
 # Assemble status line
 parts=()
-[ -n "$cwd" ]        && parts+=("$cwd")
-[ -n "$git_branch" ] && parts+=("$git_branch")
-[ -n "$model" ]      && parts+=("$model")
-[ -n "$ctx" ]        && parts+=("$ctx")
-[ -n "$cost" ]       && parts+=("$cost")
-[ -n "$limits" ]     && parts+=("$limits")
+[ -n "$cwd" ]        && parts+=("${C_DIR}${cwd}${C_RESET}")
+[ -n "$git_branch" ] && parts+=("${C_GIT} ${git_branch}${C_RESET}")
+[ -n "$model" ]      && parts+=("${C_MODEL}${model}${C_RESET}")
+[ -n "$ctx" ]        && parts+=("${C_CTX}${ctx}${C_RESET}")
+[ -n "$cost" ]       && parts+=("${C_COST}${cost}${C_RESET}")
+[ -n "$limits" ]     && parts+=("${C_LIMITS}${limits}${C_RESET}")
 
 out=""
 for p in "${parts[@]}"; do
-  [ -n "$out" ] && out+=" | "
+  [ -n "$out" ] && out+="${C_SEP} | ${C_RESET}"
   out+="$p"
 done
 printf '%s' "$out"
