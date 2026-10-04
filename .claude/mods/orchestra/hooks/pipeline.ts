@@ -29,10 +29,18 @@ const ROLE_BY_REPO: [RegExp, string][] = [
   [/^utils\/bluspark$|iac|infra|^stack$/i, 'platform-engineer'],
 ]
 
-/** Repos with no Jira project: no key to find or ask for, branches are `<type>/<slug>`. */
+/** Repos with no Jira project (and the orch-sandbox* throwaway repos): no key to find or ask for, branches are `<type>/<slug>`. */
 export const NO_JIRA_REPOS = new Set(['datalodestar'])
 
-export const hasJira = (repo: string): boolean => !NO_JIRA_REPOS.has(repo)
+export const hasJira = (repo: string): boolean => !NO_JIRA_REPOS.has(repo) && !/^orch-sandbox/.test(repo)
+
+/**
+ * Integration suites a task must also run before it reports done, by repo: the command, run
+ * from the repo. Docker sees this container's /app as the host's bluspark-stack folder.
+ */
+export const INTEGRATION: Record<string, string> = {
+  datalodestar: 'HOST_DIR=/home/dremsis/dev/bluspark-stack/datalodestar ./scripts/integration.sh',
+}
 
 /**
  * The target of operations work: the running local stack, from the workspace root, which is not
@@ -108,12 +116,26 @@ export const defaultSizing = (role: string): Sizing => ({
   why: `default for ${role}`,
 })
 
-const OVERRIDE = /(^|\s)(model|effort):(\S+)/g
+const OVERRIDE = /(^|\s)(model|effort|after|from):(\S+)/g
 
-/** Pulls `model:<x>` and `effort:<y>` out of a task: they force the development's setting. */
-export const parseOverrides = (text: string): { text: string; work: Partial<Setting> } => {
+/** What a task's `key:value` words ask: the development's setting, the tasks it waits for, its start branch. */
+export type Overrides = { text: string; work: Partial<Setting>; after: number[]; from: string }
+
+/**
+ * Pulls `model:<x>` and `effort:<y>` (they force the development's setting), `after:#n[,#m]`
+ * (the task starts once those are approved) and `from:<branch>` (its branch starts there) out of a task.
+ */
+export const parseOverrides = (text: string): Overrides => {
   const work: Partial<Setting> = {}
+  const after: number[] = []
+  let from = ''
   for (const [, , key, value] of text.matchAll(OVERRIDE)) {
+    if (key === 'after' && value) {
+      after.push(...value.split(',').map(v => Number(v.replace(/^#/, ''))).filter(n => Number.isInteger(n) && n > 0))
+    }
+    if (key === 'from' && value) {
+      from = value
+    }
     if (key === 'model' && value && (MODELS as readonly string[]).includes(value)) {
       work.model = value
     }
@@ -122,7 +144,7 @@ export const parseOverrides = (text: string): { text: string; work: Partial<Sett
     }
   }
 
-  return { text: text.replace(OVERRIDE, ' ').replace(/\s+/g, ' ').trim(), work }
+  return { text: text.replace(OVERRIDE, ' ').replace(/\s+/g, ' ').trim(), work, after: [...new Set(after)], from }
 }
 
 export const SIZING_SYSTEM = [
@@ -186,8 +208,9 @@ export const ROUTE_SYSTEM = [
   'The request names no repo: you also pick where the work happens, among the git repositories listed (paths under /app). Read the workspace overview to know what each one is.',
   `Work on the running local stack itself, with no code change in any repo (operating containers, data fixes in the local databases, reindexing, investigations, playtests), goes to the target "${STACK}".`,
   'Pick the repo whose code the change lives in. Prefer a main checkout over a ticket worktree (a folder named after a ticket, e.g. backend-bluspark-7084) unless the request names that ticket; never pick a throwaway sandbox unless the request names it; never pick a repo marked as migrated or deprecated.',
-  `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED}); they run in parallel, so say in each brief what the other side does. A request you cannot place is not forwarded: ask instead.`,
-  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","title":"one line, 100 characters at most, the Jira key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
+  `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED}); say in each brief what the other side does. Tasks run in parallel unless one needs another's result: then give it "after", the 0-based positions of the earlier tasks of your list it waits for (the frontend that consumes a new API field waits for the backend task).`,
+  `A request on a repo with a Jira project and no key: do not invent one; the developer searches Jira. A request you cannot place is not forwarded: ask instead.`,
+  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","after":[0],"title":"one line, 100 characters at most, the Jira key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
 ].join('\n')
 
 export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: string | null, text: string): string =>
@@ -201,7 +224,9 @@ export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: 
     `Request:\n${text}`,
   ].join('\n')
 
-export type Routed = { tasks: { repo: string; title: string; brief: string }[] } | { questions: string[] }
+export type RoutedTask = { repo: string; title: string; brief: string; after: number[] }
+
+export type Routed = { tasks: RoutedTask[] } | { questions: string[] }
 
 /** Reads the routing JSON, keeping only tasks on a listed repo; null when it is not one. */
 export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed | null => {
@@ -214,11 +239,13 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
     if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
       const known = new Set([STACK, ...repos.map(r => r.repo)])
       const tasks = parsed.tasks
-        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown })
+        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown; after?: unknown })
         .filter(t => typeof t.repo === 'string' && known.has(t.repo) && typeof t.brief === 'string' && t.brief.trim() !== '')
-        .map(t => {
+        .map((t, index) => {
           const brief = String(t.brief).trim()
-          return { repo: String(t.repo), title: firstLine(typeof t.title === 'string' ? t.title.trim() : '') || firstLine(brief), brief }
+          // Only earlier tasks of the same list: no cycle, and their ids exist by then.
+          const after = Array.isArray(t.after) ? t.after.filter((n): n is number => Number.isInteger(n) && n >= 0 && n < index) : []
+          return { repo: String(t.repo), title: firstLine(typeof t.title === 'string' ? t.title.trim() : '') || firstLine(brief), brief, after }
         })
         .slice(0, MAX_ROUTED)
       return tasks.length > 0 && tasks.length === Math.min(parsed.tasks.length, MAX_ROUTED) ? { tasks } : null
@@ -292,7 +319,7 @@ const branchRule = (task: Task): string => {
   const start = task.branchFrom || 'HEAD'
 
   return hasJira(task.repo)
-    ? `- Branch named after the Jira key of the task (BLUSPARK-<n>), created from ${from} (git switch -c <key> ${start}), never from another task's branch. No key in the task: report STATUS: blocked and ask for it.`
+    ? `- Branch named after the Jira key of the task (BLUSPARK-<n>), created from ${from} (git switch -c <key> ${start}), never from another task's branch. No key in the task: search Jira yourself first (the Atlassian tools, JQL on project BLUSPARK from the task's subject, open tickets first). Exactly one ticket fits: use its key and name it in SUMMARY. None or several: report STATUS: blocked with the candidates (key, summary, status) in NEEDS.`
     : `- This repo has no Jira project: never look for or ask for a ticket key. Branch named <type>/<short-slug> like the repo's existing branches (feat/…, fix/…, perf/…, chore/…), created from ${from} (git switch -c <branch> ${start}), never from another task's branch.`
 }
 
@@ -317,6 +344,7 @@ export const workerBrief = (self: string, task: Task): string =>
     '',
     `Repo: /app/${task.repo} (work only there)`,
     `Task: ${task.text}`,
+    ...(task.prior ? ['', task.prior] : []),
     '',
     'Rules:',
     branchRule(task),
@@ -324,10 +352,12 @@ export const workerBrief = (self: string, task: Task): string =>
       ? '- Commit locally with the project\'s git identity and subject format; never push.'
       : '- Commit locally with the project\'s git identity and subject format, without any ticket key; never push.',
     '- Run the relevant tests before reporting.',
+    ...(INTEGRATION[task.repo] ? [`- Run the integration suite too, from the repo: ${INTEGRATION[task.repo]}. A task is not done while it fails; report its result in TESTS.`] : []),
     '',
     `When finished, reply via SendMessage to "${self}" with:`,
     'STATUS: done | blocked | failed',
     'SUMMARY: <2-5 lines>',
+    'BRANCH: <the task branch, exactly as git names it>',
     'CHANGES: <branch, commits>',
     'TESTS: <what ran, result>',
     'NEEDS: <decision required from the person, if any>',
@@ -339,6 +369,7 @@ const stackBrief = (self: string, task: Task): string =>
     '',
     'Target: the running local Bluspark stack, working from /app',
     `Task: ${task.text}`,
+    ...(task.prior ? ['', task.prior] : []),
     '',
     'Rules:',
     ...STACK_RULES,
@@ -435,6 +466,9 @@ export const reviewBrief = (self: string, task: Task): string =>
     ...(hasJira(task.repo)
       ? []
       : ['This repo has no Jira project: no ticket key in the branch or commits, and the acceptance criteria are the brief\'s "Done when" list. Never raise a missing key as a finding.']),
+    ...(INTEGRATION[task.repo]
+      ? [`This repo's integration suite (${INTEGRATION[task.repo]}) must have run green on the final code: a report whose TESTS does not show it is a 🔴 finding. Rerun it yourself when the report leaves a doubt.`]
+      : []),
     '',
     'Worker report:',
     task.report,
@@ -508,13 +542,80 @@ const ACTIVE: Task['state'][] = ['working', 'reviewing', 'blocked', 'escalated']
  * The next dispatches: queued tasks in order, one active task per repo, one task per
  * worker. A task gets an idle worker of its repo, role, model and effort, or `null`: launch one.
  */
+/** Whether every task this one waits for is approved. */
+export const isReady = (task: Task, tasks: readonly Task[]): boolean =>
+  (task.after ?? []).every(id => tasks.find(t => t.id === id)?.state === 'approved')
+
+/** A task this one waits for that will never be approved (dropped), if any. */
+export const deadDependency = (task: Task, tasks: readonly Task[]): number | null =>
+  (task.after ?? []).find(id => tasks.find(t => t.id === id)?.state === 'dropped') ?? null
+
+/** What a brief says about the approved tasks this one waited for. */
+export const priorNote = (task: Task, tasks: readonly Task[]): string => {
+  const prior = (task.after ?? []).map(id => tasks.find(t => t.id === id)).filter((t): t is Task => t !== undefined)
+  if (prior.length === 0) {
+    return ''
+  }
+  return [
+    'This task runs after these approved tasks; build on their work, do not redo it:',
+    ...prior.map(t => {
+      const where = isStack(t.repo) ? 'on the running stack' : `on branch ${t.branch || '(see its report)'} in /app/${t.repo}, not pushed`
+      return `- #${t.id} (${t.repo}) ${firstLine(t.text)}: its work is ${where}. Its report: ${(t.report.split('\n').find(l => /^\s*SUMMARY:/i.test(l)) ?? '').trim()}`
+    }),
+  ].join('\n')
+}
+
+const BRANCH = /^\s*BRANCH:\s*`?([^\s`]+)`?/im
+
+/** The task branch a worker's report names. */
+export const parseBranch = (report: string): string => BRANCH.exec(report)?.[1] ?? ''
+
+/** Writes the pull request of an approved task from what the pipeline knows of it. */
+export const PR_SYSTEM = [
+  'You write the pull request of a change that a developer agent made and a reviewer agent approved.',
+  'Write it in English. Title: one line, 72 characters at most, the Jira key first when the task has one. Body, markdown: ## Summary (what and why, 2-4 lines), ## Changes (bullets, from the commits), ## Tests (what ran and the result, as the report says), ## Notes (the reviewer\'s remaining remarks and open questions; leave the section out when there are none).',
+  'Say only what the task, report, review and commits say: never invent tests, numbers or behaviour.',
+  'Reply with JSON only: {"title":"…","body":"…, newlines as \\n"}',
+].join('\n')
+
+export const prPrompt = (task: Task, commits: string): string =>
+  [
+    `Repo: ${task.repo}`,
+    `Branch: ${task.branch} into ${task.branchFrom}`,
+    `Task:\n${task.text}`,
+    `Worker report:\n${task.report}`,
+    `Reviewer findings (round ${task.reviews.at(-1)?.round ?? task.round}):\n${task.reviews.at(-1)?.findings || '(none)'}`,
+    `Commits:\n${commits}`,
+  ].join('\n\n')
+
+/** The line every pull request body ends with. */
+export const PR_FOOTER = '🤖 Generated with [Claude Code](https://claude.com/claude-code)'
+
+export const parsePr = (reply: string): { title: string; body: string } | null => {
+  const json = /\{[\s\S]*\}/.exec(reply)?.[0]
+  if (!json) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(json) as { title?: unknown; body?: unknown }
+    if (typeof parsed.title !== 'string' || typeof parsed.body !== 'string' || !parsed.title.trim() || !parsed.body.trim()) {
+      return null
+    }
+    const body = parsed.body.trim()
+    return { title: firstLine(parsed.title.trim()).slice(0, 72), body: body.includes(PR_FOOTER) ? body : `${body}\n\n${PR_FOOTER}` }
+  } catch {
+    return null
+  }
+}
+
 export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Worker | null }[] => {
   const busyRepos = new Set(tasks.filter(t => ACTIVE.includes(t.state)).map(t => t.repo))
   const taken = new Set<string>()
   const moves: { task: Task; worker: Worker | null }[] = []
 
   for (const task of tasks.filter(t => t.state === 'queued')) {
-    if (busyRepos.has(task.repo)) {
+    // A task waiting for another does not hold its repo: the next one of that repo may go first.
+    if (busyRepos.has(task.repo) || !isReady(task, tasks)) {
       continue
     }
     const worker =

@@ -121,7 +121,8 @@ test('reads the sizing reply and the forced settings', async () => {
   })
   expect(parseSizing('{"work":{"model":"gpt","effort":"high"},"review":{"model":"opus","effort":"high"}}')).toBeNull()
   expect(parseSizing('no json')).toBeNull()
-  expect(parseOverrides('fix it model:sonnet effort:low now')).toEqual({ text: 'fix it now', work: { model: 'sonnet', effort: 'low' } })
+  expect(parseOverrides('fix it model:sonnet effort:low now')).toEqual({ text: 'fix it now', work: { model: 'sonnet', effort: 'low' }, after: [], from: '' })
+  expect(parseOverrides('fix after:#3,4 it after:2 from:main')).toEqual({ text: 'fix it', work: {}, after: [3, 4, 2], from: 'main' })
   expect(parseOverrides('fix model:gpt').work).toEqual({})
 })
 
@@ -210,13 +211,25 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     }
     return { result: { success: true } }
   })
+  // Every command run, and the person's desktop alerts.
+  const commands: string[][] = []
+  const alerts: string[] = []
+  on('tool.call', { tool: 'PushNotification' }, (_$, e) => {
+    alerts.push(String(e.message))
+    return { result: { sent: true } }
+  })
   on('process.run', (_$, e) => {
     const [cmd, sub, ...rest] = e.argv
+    commands.push([...e.argv])
     let stdout = ''
     if (cmd === 'python3') {
       stdout = python(e.argv)
+    } else if (cmd === 'git' && e.argv.includes('--verify') && e.argv.some(a => a.startsWith('nope'))) {
+      return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     } else if (cmd === 'git') {
-      stdout = e.argv.includes('--abbrev-ref') ? 'main\n' : 'abc123\n'
+      stdout = e.argv.includes('--abbrev-ref') ? 'main\n' : e.argv.includes('--show-current') ? 'main\n' : 'abc123\n'
+    } else if (cmd === 'gh') {
+      stdout = 'https://github.com/QuentinJost/DataLodestar/pull/7\n'
     } else if (cmd === 'claude' && sub === '--bg') {
       ids += 1
       const flag = (name: string) => rest[rest.indexOf(name) + 1] ?? ''
@@ -245,6 +258,8 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     asked,
     clock,
     submitted,
+    commands,
+    alerts,
     holdSends: (count: number) => {
       holds = count
     },
@@ -455,7 +470,7 @@ test('the band above the prompt sums up open tasks, and steps aside when none is
 test('queues several tasks in one command', async ($, on) => {
   const { launched } = world(on)
   const ran = await orch($, 'task core/bluspark-backend BLUSPARK-1 a ;; core/bluspark-frontend BLUSPARK-2 b ;; core/bluspark-backend BLUSPARK-3 c')
-  expect(ran).toMatchObject({ text: '3 tasks queued.' })
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #3 queued in core/bluspark-backend.\nBranch starts from main') })
   expect(launched.map(l => l.name)).toEqual(['orch-lead-backend-bluspark-backend', 'orch-lead-frontend-bluspark-frontend'])
   const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
   expect(await stateOf(ui, 3)).toBe('◌ queued')
@@ -588,7 +603,10 @@ const routedWorld = (on: On, route: unknown) => {
 
 test('reads the routing reply: tasks on listed repos only, or questions', async () => {
   const ok = parseRouting(JSON.stringify({ status: 'ready', tasks: [{ repo: 'datalodestar', title: 'T', brief: 'B' }] }), REPOS)
-  expect(ok).toEqual({ tasks: [{ repo: 'datalodestar', title: 'T', brief: 'B' }] })
+  expect(ok).toEqual({ tasks: [{ repo: 'datalodestar', title: 'T', brief: 'B', after: [] }] })
+  // `after` keeps earlier positions only: no cycle, nothing pointing past the list.
+  const chained = parseRouting(JSON.stringify({ status: 'ready', tasks: [{ repo: 'core/bluspark-backend', brief: 'B', after: [1] }, { repo: 'core/bluspark-frontend', brief: 'F', after: [0, 5] }] }), REPOS)
+  expect(chained).toMatchObject({ tasks: [{ after: [] }, { after: [0] }] })
   // A task on a repo that is not listed spoils the whole answer: nothing half-queued.
   expect(parseRouting(JSON.stringify({ status: 'ready', tasks: [{ repo: 'datalodestar', brief: 'B' }, { repo: 'nowhere', brief: 'B' }] }), REPOS)).toBeNull()
   expect(parseRouting(JSON.stringify({ status: 'unclear', questions: ['Which repo?'] }), REPOS)).toEqual({ questions: ['Which repo?'] })
@@ -683,6 +701,131 @@ test('/orch prompt without a repo may route to the stack', async ($, on) => {
   expect(asked[0]?.prompt).toContain('- stack — the running local Bluspark stack, no git')
   expect(launched[0]?.name).toBe('orch-platform-engineer-stack')
   expect(launched[0]?.prompt).toContain('Target: the running local Bluspark stack')
+})
+
+test('a task waits for the ones it is after, then builds on their branch', async ($, on) => {
+  const { launched } = world(on)
+  await orch($, 'task core/bluspark-backend BLUSPARK-7400 expose the day')
+  const ran = await orch($, 'task core/bluspark-frontend BLUSPARK-7400 show the day after:#1')
+  expect(ran).toMatchObject({ text: expect.stringContaining('Waits for #1 to be approved.') })
+  // Its repo is free, but #1 is not approved: only the backend runs.
+  expect(launched.map(l => l.name)).toEqual(['orch-lead-backend-bluspark-backend'])
+
+  await receive($, 'orch-lead-backend-bluspark-backend', 'STATUS: done\nSUMMARY: day exposed\nBRANCH: BLUSPARK-7400')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  const front = launched.find(l => l.name === 'orch-lead-frontend-bluspark-frontend')
+  expect(front?.prompt).toContain('This task runs after these approved tasks')
+  expect(front?.prompt).toContain('#1 (core/bluspark-backend) BLUSPARK-7400 expose the day: its work is on branch BLUSPARK-7400 in /app/core/bluspark-backend')
+  expect(front?.prompt).toContain('SUMMARY: day exposed')
+})
+
+test('after a task of the same repo, the branch starts from that task branch; from: overrides', async ($, on) => {
+  const { launched, sent } = world(on)
+  await orch($, 'task datalodestar first part')
+  const queued = await orch($, 'task datalodestar second part after:#1')
+  expect(queued).toMatchObject({ text: expect.stringContaining('Branch starts from the branch of the task it waits for in this repo') })
+  await receive($, 'orch-lead-backend-datalodestar', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/first-part')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  // The idle worker of the repo takes #2, briefed to branch from #1's branch.
+  const brief = [...sent.map(m => m.text), ...launched.map(l => l.prompt)].find(t => t.includes('task #2 · round 1'))
+  expect(brief).toContain('created from feat/first-part (git switch -c <branch> feat/first-part)')
+  const second = (await orch($, 'task datalodestar third part from:release'))
+  expect(second).toMatchObject({ text: expect.stringContaining('Branch starts from release (asked).') })
+})
+
+test('a start branch that does not exist, or a task to wait for that does not, queues nothing', async ($, on) => {
+  const { launched } = world(on)
+  expect(await orch($, 'task datalodestar x from:nope')).toMatchObject({ text: 'Not queued: no branch or commit "nope" in datalodestar.' })
+  expect(await orch($, 'task datalodestar x after:#9')).toMatchObject({ text: 'Not queued: no task #9 to wait for.' })
+  expect(await orch($, 'task stack x from:main')).toMatchObject({ text: expect.stringContaining('does not apply to the stack') })
+  expect(launched).toHaveLength(0)
+})
+
+test('a task after a dropped one is blocked and the person alerted', async ($, on) => {
+  const { alerts } = world(on)
+  await orch($, 'task core/bluspark-backend BLUSPARK-1 a')
+  await orch($, 'task core/bluspark-frontend BLUSPARK-1 b after:#1')
+  await orch($, 'drop 1')
+  const ui = await $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+  expect(await stateOf(ui, 2)).toBe('⏸ blocked')
+  expect(alerts).toContain('Task #2 blocked: it waits for #1, which was dropped')
+})
+
+test('a routed request chains its tasks by position', async ($, on) => {
+  const { launched } = routedWorld(on, {
+    status: 'ready',
+    tasks: [
+      { repo: 'core/bluspark-backend', title: 'BLUSPARK-7400 API', brief: 'back' },
+      { repo: 'core/bluspark-frontend', title: 'BLUSPARK-7400 page', brief: 'front', after: [0] },
+    ],
+  })
+  const ran = await orch($, 'prompt BLUSPARK-7400 show the collection day')
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #2 queued in core/bluspark-frontend for lead-frontend with this brief:\nWaits for #1 to be approved.') })
+  expect(launched.map(l => l.name)).toEqual(['orch-lead-backend-bluspark-backend'])
+})
+
+test('a Bluspark worker without a key searches Jira before it blocks; a repo with an integration suite runs it', async ($, on) => {
+  const { launched } = world(on)
+  await orch($, 'task core/bluspark-backend fix the export')
+  expect(launched[0]?.prompt).toContain('No key in the task: search Jira yourself first')
+  expect(launched[0]?.prompt).toContain('BRANCH: <the task branch')
+  expect(launched[0]?.prompt).not.toContain('integration suite')
+
+  await orch($, 'task datalodestar bulk delete')
+  const worker = launched.find(l => l.name === 'orch-lead-backend-datalodestar')
+  expect(worker?.prompt).toContain('Run the integration suite too, from the repo: HOST_DIR=/home/dremsis/dev/bluspark-stack/datalodestar ./scripts/integration.sh')
+  await receive($, 'orch-lead-backend-datalodestar', 'STATUS: done\nSUMMARY: ok')
+  expect(launched.at(-1)?.prompt).toContain('integration suite (HOST_DIR=')
+  expect(launched.at(-1)?.prompt).toContain('a report whose TESTS does not show it is a 🔴 finding')
+})
+
+test('the person is alerted when a task needs them or is approved, not on progress', async ($, on) => {
+  const { alerts } = world(on)
+  await orch($, 'task datalodestar a')
+  expect(alerts).toEqual([])
+  await receive($, 'orch-lead-backend-datalodestar', 'STATUS: blocked\nSUMMARY: stuck\nNEEDS: which table?')
+  expect(alerts).toEqual(['Task #1 blocked in datalodestar: which table?'])
+  await receive($, 'orch-lead-backend-datalodestar', 'STATUS: done\nSUMMARY: ok')
+  expect(alerts).toHaveLength(1)
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  expect(alerts.at(-1)).toBe('Task #1 approved in datalodestar')
+})
+
+test('/orch pr drafts first, sends only on confirm', async ($, on) => {
+  const { commands } = world(on, JSON.stringify(SIZING), e =>
+    e.system?.includes('pull request') ? JSON.stringify({ title: 'Bulk delete of databases', body: '## Summary\nDelete several.' }) : JSON.stringify(SIZING),
+  )
+  await orch($, 'task datalodestar bulk delete')
+  expect(await orch($, 'pr 1')).toMatchObject({ text: 'Task #1 is working: only an approved task gets a pull request.' })
+  await receive($, 'orch-lead-backend-datalodestar', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/bulk-delete')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+
+  expect(await orch($, 'pr 1 confirm')).toMatchObject({ text: expect.stringContaining('draft the pull request first') })
+  const draft = await orch($, 'pr 1')
+  expect(draft).toMatchObject({ text: expect.stringContaining('not sent yet') })
+  expect(draft).toMatchObject({ text: expect.stringContaining('Push feat/bulk-delete to origin, into main.') })
+  expect(draft).toMatchObject({ text: expect.stringContaining('🤖 Generated with [Claude Code]') })
+  expect(commands.some(c => c.includes('push') || c[0] === 'gh')).toBe(false)
+
+  const sent = await orch($, 'pr 1 confirm')
+  expect(sent).toMatchObject({ text: 'Task #1: feat/bulk-delete pushed and pull request opened: https://github.com/QuentinJost/DataLodestar/pull/7' })
+  expect(commands).toContainEqual(['git', '-C', '/app/datalodestar', 'push', '-u', 'origin', 'feat/bulk-delete'])
+  const gh = commands.find(c => c[0] === 'gh')
+  expect(gh?.slice(0, 7)).toEqual(['gh', 'pr', 'create', '--base', 'main', '--head', 'feat/bulk-delete'])
+  expect(await orch($, 'pr 1')).toMatchObject({ text: expect.stringContaining('already has its pull request') })
+})
+
+test('the first queued task of a session reminds the person of Remote Control, once', async ($, on) => {
+  world(on)
+  expect(await orch($, 'drop 9')).not.toMatchObject({ text: expect.stringContaining('remote-control') })
+  expect(await orch($, 'task datalodestar a')).toMatchObject({ text: expect.stringContaining('run /remote-control in this session') })
+  expect(await orch($, 'task orch-sandbox b')).not.toMatchObject({ text: expect.stringContaining('remote-control') })
+})
+
+test('no Remote Control reminder once a prompt came in through it', async ($, on) => {
+  world(on)
+  await $.prompt.submit({ text: 'hello from the phone', origin: { kind: 'bridge' }, wait: false } as never)
+  expect(await orch($, 'task datalodestar a')).not.toMatchObject({ text: expect.stringContaining('remote-control') })
 })
 
 test('retry answers a blocked worker and tells whether it was delivered', async ($, on) => {

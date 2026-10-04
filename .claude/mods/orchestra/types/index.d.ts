@@ -28,6 +28,18 @@ export type Task = {
   sizing: Sizing
   reviews: Review[]
   updatedAt: number
+  /** Tasks that must be approved before this one starts. */
+  after?: number[]
+  /** The start branch the person asked with `from:`, over the repo's default. */
+  from?: string
+  /** The task branch, from the worker's BRANCH line. */
+  branch?: string
+  /** What the brief says about the tasks this one waited for. */
+  prior?: string
+  /** The pull request drafted by `/orch pr`, sent on `/orch pr <id> confirm`. */
+  prDraft?: { title: string; body: string }
+  /** The pull request's URL once opened. */
+  pr?: string
 }
 
 /** A background session this orchestrator launched; `task` is the one it holds, if any. */
@@ -76,6 +88,10 @@ declare module 'claude-code' {
       selected: number
       usage: Record<string, WorkerUsage>
       showDone: boolean
+      /** A prompt came in through Remote Control in this session: it is connected. */
+      remoteSeen: boolean
+      /** The Remote Control reminder was given in this session. */
+      reminded: boolean
     }
   }
 }
