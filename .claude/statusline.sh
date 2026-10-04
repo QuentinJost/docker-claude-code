@@ -36,7 +36,8 @@ fi
 model=$(echo "$input" | jq -r '.model.display_name // empty')
 fast=$(echo "$input" | jq -r '.fast_mode // false')
 
-pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
+# Rounded: the bash tests and arithmetic below only accept integers
+pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty | round')
 tokens=$(echo "$input" | jq -r '
   (.context_window.total_input_tokens // 0) as $t |
   if $t >= 1000 then (($t / 1000 * 10 | floor) / 10 | tostring) + "k"
