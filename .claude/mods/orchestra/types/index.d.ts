@@ -68,7 +68,7 @@ export type WorkerUsage = {
   turns: number
   cost: number
   isPriced: boolean
-  /** The task the session held when last read, and its role (`reviewer`, `orchestrator`, a cortex role). */
+  /** The task the session held when last read, and its role (`reviewer`, `orchestrator`, a workspace role). */
   task: number | null
   role: string
   at: number

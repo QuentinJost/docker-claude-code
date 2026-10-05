@@ -12,7 +12,6 @@ import {
   MAX_ROUTED,
   ORCHESTRATOR_MODEL,
   ROUTE_SYSTEM,
-  STACK,
   REVIEWER,
   SIZING_SYSTEM,
   UPGRADE_SYSTEM,
@@ -39,7 +38,6 @@ import {
   priorNote,
   deadDependency,
   reviewBrief,
-  isStack,
   routePrompt,
   reviewerAgent,
   reworkBrief,
@@ -53,10 +51,10 @@ import {
   workerBrief,
   workerName,
 } from './pipeline'
+import { ROOT, allWorkspaces, isTarget, parseWorkspaces, setWorkspaces, targetNames, workspaceDir } from './workspace'
 
 const PANE = 'orchestra'
 const PANE_BACKGROUND = 'bashMessageBackgroundColor'
-const ROOT = '/app'
 const REFRESH_MS = 30_000
 const FEED_MAX = 300
 // How long a report may trail its session's idle notice before the silence counts.
@@ -312,7 +310,7 @@ async function size($: EngineInterface, repo: string, role: string, text: string
   const reply = await $.model
     .complete({ model: ORCHESTRATOR_MODEL, system: SIZING_SYSTEM, prompt: sizingPrompt(repo, role, text), maxTokens: 400, effort: 'medium' })
     .catch(() => null)
-  const sized: Sizing = (reply?.isAnswered ? parseSizing(reply.text) : null) ?? defaultSizing(role)
+  const sized: Sizing = (reply?.isAnswered ? parseSizing(reply.text) : null) ?? defaultSizing(role, repo)
   const asked = { ...sized.work, ...forced }
   const work = atLeast(asked, WORK_FLOOR)
   const review = atLeast(sized.review, SESSION_FLOOR)
@@ -346,8 +344,8 @@ async function refusal($: EngineInterface, { repo, after, from }: Input): Promis
   if (unknown.length > 0) {
     return `no task ${unknown.map(id => `#${id}`).join(', ')} to wait for`
   }
-  if (from && isStack(repo)) {
-    return `from: does not apply to the stack, which has no branches`
+  if (from && isTarget(repo)) {
+    return `from: does not apply to ${repo}, which is not a git repo`
   }
   if (from && (await exec($, ['git', '-C', `${ROOT}/${repo}`, 'rev-parse', '--verify', '--quiet', `${from}^{commit}`])).exitCode !== 0) {
     return `no branch or commit "${from}" in ${repo}`
@@ -357,8 +355,8 @@ async function refusal($: EngineInterface, { repo, after, from }: Input): Promis
 
 /** Where a task's branch will start, as the person is told when it is queued. */
 async function startLine($: EngineInterface, task: Task): Promise<string> {
-  if (isStack(task.repo)) {
-    return 'Runs on the stack: no branch.'
+  if (isTarget(task.repo)) {
+    return `Runs on ${task.repo}, not a git repo: no branch.`
   }
   if (task.from) {
     return `Branch starts from ${task.from} (asked).`
@@ -435,7 +433,7 @@ async function upgradeTask($: EngineInterface, input: string): Promise<string> {
   const repos = await listRepos($)
   const first = parseTask(input)?.repo
   // A request that does not start with a repo of the workspace is routed: the model picks where.
-  if (repos.length > 0 && !isStack(first ?? '') && !repos.some(r => r.repo === first)) {
+  if (repos.length > 0 && !isTarget(first ?? '') && !repos.some(r => r.repo === first)) {
     return routeTask($, input, repos)
   }
   const parsed = parseInput(input)
@@ -475,14 +473,25 @@ async function listRepos($: EngineInterface): Promise<RepoInfo[]> {
   }
 }
 
-/** The workspace overview the router reads beside the repo list: the team's file, then the developer's. */
+/**
+ * Reads every workspace's orchestra.json under the root (hooks/repos.py --workspaces) and puts
+ * their rules in force; none readable leaves the generic defaults. Read again on every entry
+ * into the pipeline: an edited workspace file applies from the next step, no reload needed.
+ */
+async function loadWorkspaces($: EngineInterface) {
+  const ran = await exec($, ['python3', `${$.plugin.root}/hooks/repos.py`, '--workspaces', ROOT]).catch(() => null)
+  setWorkspaces(parseWorkspaces(ran?.stdout ?? ''))
+}
+
+/** The overviews the router reads beside the repo list: the files each workspace names. */
 async function workspaceOverview($: EngineInterface): Promise<string> {
   const parts: string[] = []
-  for (const path of [`${ROOT}/agents/project-overview.md`, `${ROOT}/project-overview.md`]) {
-    const text = await $.fs.read(path).catch(() => '')
-    // The developer's file is often the untouched template: only its filled-in lines tell anything.
-    if (text.trim() && !/\[Project \/ service name\]/.test(text)) {
-      parts.push(text.slice(0, 8000))
+  for (const ws of allWorkspaces()) {
+    for (const file of ws.overview ?? []) {
+      const text = await $.fs.read(`${workspaceDir(ws)}/${file}`).catch(() => '')
+      if (text.trim()) {
+        parts.push(text.slice(0, 8000))
+      }
     }
   }
   return parts.join('\n\n')
@@ -555,20 +564,25 @@ async function dispatch($: EngineInterface) {
   for (const { task, worker } of plan(await read($, tasks), await read($, workers))) {
     // The branch starts from: the one the person asked; else, after a task of the same repo,
     // that task's branch; else where the repo stood at its first task, not whatever task
-    // branch the previous worker left checked out. The stack is not a repo: no branch, no base.
+    // branch the previous worker left checked out. A non-git target: no branch, no base.
     const all = await read($, tasks)
     const git = (...args: string[]) => exec($, ['git', '-C', `${ROOT}/${task.repo}`, ...args])
     const sameRepoDep = (task.after ?? []).map(id => all.find(t => t.id === id)).find(t => t?.repo === task.repo && t.branch)
-    const branchFrom = isStack(task.repo)
+    const branchFrom = isTarget(task.repo)
       ? ''
       : task.from ||
         sameRepoDep?.branch ||
         (all.find(t => t.repo === task.repo && t.branchFrom && !t.from && !(t.after ?? []).length)?.branchFrom ??
           (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim())
-    const head = isStack(task.repo) ? { exitCode: 0, stdout: '' } : await git('rev-parse', branchFrom || 'HEAD')
+    const head = isTarget(task.repo) ? { exitCode: 0, stdout: '' } : await git('rev-parse', branchFrom || 'HEAD')
     if (head.exitCode !== 0) {
-      await patchTask($, task.id, { state: 'blocked', report: `not a git repo: ${ROOT}/${task.repo}` })
-      await notify($, `#${task.id}`, `blocked: ${ROOT}/${task.repo} is not a git repository (use "${STACK}" for work on the running stack)`)
+      // A repo whose branch has no commit yet has no HEAD either: say so, not "not a repo".
+      const isRepo = (await git('rev-parse', '--git-dir')).exitCode === 0
+      const why = isRepo
+        ? `${ROOT}/${task.repo} has no commit to branch from${task.from ? ` (${task.from})` : ''}: make a first commit, then /orch retry ${task.id}`
+        : `${ROOT}/${task.repo} is not a git repository${targetNames().length ? ` (non-git targets: ${targetNames().join(', ')})` : ''}`
+      await patchTask($, task.id, { state: 'blocked', report: blockedReport(why) })
+      await notify($, `#${task.id}`, `blocked: ${why}`)
       continue
     }
     const prior = priorNote(task, all)
@@ -595,7 +609,7 @@ async function dispatch($: EngineInterface) {
     const used = (await read($, workers)).map(w => w.name).concat((await read($, peers)).map(p => p.name))
     const name = workerName(task.role, task.repo, used)
     const { work } = task.sizing
-    const bgId = await launch($, name, agentName(task.role), workerAgent(task.role), work, brief)
+    const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo), work, brief)
     if (!bgId) {
       await patchTask($, task.id, { state: 'blocked', report: 'worker launch failed' })
       await alertPerson($, `Task #${task.id} blocked: its worker session could not be launched`)
@@ -620,7 +634,7 @@ async function startReview($: EngineInterface, task: Task) {
   // Also for a task sized before the floor existed.
   const review = atLeast(task.sizing.review, SESSION_FLOOR)
   const brief = reviewBrief(me, task)
-  const bgId = await launch($, name, REVIEWER, reviewerAgent(), review, brief)
+  const bgId = await launch($, name, REVIEWER, reviewerAgent(task.repo), review, brief)
   if (!bgId) {
     await patchTask($, task.id, { state: 'blocked', report: 'reviewer launch failed' })
     await alertPerson($, `Task #${task.id} blocked: its reviewer session could not be launched`)
@@ -649,7 +663,7 @@ async function onWorkerReport($: EngineInterface, worker: Worker, text: string) 
   if (status === 'done') {
     // The task branch, for the next task that builds on it and for /orch pr: the report's
     // BRANCH line, else the branch the repo is on when it differs from the start.
-    const current = isStack(task.repo) ? '' : (await exec($, ['git', '-C', `${ROOT}/${task.repo}`, 'branch', '--show-current'])).stdout.trim()
+    const current = isTarget(task.repo) ? '' : (await exec($, ['git', '-C', `${ROOT}/${task.repo}`, 'branch', '--show-current'])).stdout.trim()
     const branch = parseBranch(text) || (current !== task.branchFrom ? current : '')
     const reported = { ...task, report: body(text), ...(branch ? { branch } : {}) }
     await patchTask($, task.id, { report: reported.report, ...(branch ? { branch } : {}) })
@@ -735,7 +749,7 @@ async function replaceWorker($: EngineInterface, task: Task, text: string): Prom
   const name = workerName(task.role, task.repo, used)
   const { work } = task.sizing
   const brief = takeoverBrief(await read($, self), task, task.worker, text)
-  const bgId = await launch($, name, agentName(task.role), workerAgent(task.role), work, brief)
+  const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo), work, brief)
   if (!bgId) {
     return { worker: task.worker, isFresh: false, reason: `${task.worker} is gone and no new session could be launched` }
   }
@@ -825,6 +839,9 @@ async function onReceive($: EngineInterface, text: string): Promise<{ isOwn: boo
   }
   await log($, { direction: 'in', peer: inbound.peer, text: oneLine(text) })
   const sender = (await read($, workers)).find(w => w.name === inbound.peer)
+  if (sender) {
+    await loadWorkspaces($)
+  }
   if (sender?.role === 'reviewer') {
     return { isOwn: true, digest: await onReviewerReport($, sender, text) }
   }
@@ -841,6 +858,9 @@ async function onReceive($: EngineInterface, text: string): Promise<{ isOwn: boo
  */
 async function onIdleWithoutReport($: EngineInterface, name: string) {
   const worker = (await read($, workers)).find(w => w.name === name)
+  if (worker) {
+    await loadWorkspaces($)
+  }
   const task = worker && (await read($, tasks)).find(t => t.id === worker.task)
   const awaited = worker?.role === 'reviewer' ? 'reviewing' : 'working'
   if (!worker || !task || task.state !== awaited || !worker.brief) {
@@ -876,8 +896,8 @@ async function prTask($: EngineInterface, id: number, isConfirmed: boolean): Pro
   if (task.state !== 'approved') {
     return `Task #${id} is ${task.state}: only an approved task gets a pull request.`
   }
-  if (isStack(task.repo)) {
-    return `Task #${id} ran on the stack: there is no branch to open a pull request from.`
+  if (isTarget(task.repo)) {
+    return `Task #${id} ran on ${task.repo}, not a git repo: there is no branch to open a pull request from.`
   }
   if (task.pr) {
     return `Task #${id} already has its pull request: ${task.pr}`
@@ -987,7 +1007,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'orch',
-      description: 'Orchestra: `task <repo> <description> [@role]`, `prompt [<repo>] <request> [@role]` (brief written by the model first; without a repo it picks the repo; `stack` = the running stack, no git), `retry <id> [note]`, `pr <id> [confirm]`, `drop <id>`, `stop-idle`, `<session> <message>`',
+      description: 'Orchestra: `task <repo> <description> [@role]`, `prompt [<repo>] <request> [@role]` (brief written by the model first; without a repo it picks the repo; a workspace non-git target by its name), `retry <id> [note]`, `pr <id> [confirm]`, `drop <id>`, `stop-idle`, `<session> <message>`',
     })
     $.clock.every(REFRESH_MS, () => void refresh($))
     void refresh($)
@@ -996,6 +1016,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {
+    await loadWorkspaces($)
     await refresh($)
     const before = added
     let text = await runCommand($, e.args)
