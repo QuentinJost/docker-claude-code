@@ -197,6 +197,11 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
   `CORTEX_VERSION` in the Dockerfile, rebuild (`docker compose up -d --build`,
   which restarts the container and every session in it), then bump the version
   in that `roles.from` path.
+- **Personality** — `cortex/personalities/the-boys/` is a Cortex personality
+  theme kept with this repo (Cortex ships `h2g2` only). The orchestra's workers
+  play their role's character and its reviewer plays Kimiko (`personality` in
+  `~/dev/orchestra.json`, read from `/claude-code/cortex/personalities/the-boys`);
+  the briefs and the orchestrator's own prompts stay neutral.
 - **UID/GID 1000** — `www-data` is remapped to 1000:1000 so files created in
   the mounted project keep sane ownership on a typical Linux host. If your
   host user isn't 1000, adjust the `usermod`/`groupmod` lines in the
