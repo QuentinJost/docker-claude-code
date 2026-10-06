@@ -193,14 +193,14 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
   the spec of the pinned version in the read-only store,
   `/opt/cortex/versions/<CORTEX_VERSION>`, with Cortex's `LICENSE` and `NOTICE`
   in `/opt/cortex`. The orchestra mod builds each worker's agent from the role
-  cards there (`roles.from` in `~/dev/orchestra.json`). To upgrade: bump
+  cards there (`roles.from` in `orchestra/orchestra.json`, which rules every repo under `~/dev`). To upgrade: bump
   `CORTEX_VERSION` in the Dockerfile, rebuild (`docker compose up -d --build`,
   which restarts the container and every session in it), then bump the version
   in that `roles.from` path.
 - **Personality** — `cortex/personalities/the-boys/` is a Cortex personality
   theme kept with this repo (Cortex ships `h2g2` only). The orchestra's workers
   play their role's character and its reviewer plays Kimiko (`personality` in
-  `~/dev/orchestra.json`, read from `/claude-code/cortex/personalities/the-boys`);
+  `orchestra/orchestra.json`, read from `/claude-code/cortex/personalities/the-boys`);
   the briefs and the orchestrator's own prompts stay neutral.
 - **UID/GID 1000** — `www-data` is remapped to 1000:1000 so files created in
   the mounted project keep sane ownership on a typical Linux host. If your
@@ -212,3 +212,4 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
 - Claude Code docs: https://docs.claude.com/en/docs/claude-code/overview
 - rtk: https://github.com/rtk-ai/rtk
 - Cortex: https://github.com/adorey/cortex
+- Orchestra (the `/orch` mod): [docs/orchestra.md](docs/orchestra.md)
