@@ -9,6 +9,7 @@ import { BADGE, STATES, ago, lastFindings, ordered, reportLine, roundDots } from
 import { body, deliveryFailure, isAutoModeHold, oneLine, parseBackgrounded, parseInbound, parseListing } from './parse'
 import {
   MAX_ROUNDS,
+  REUSE_CONTEXT_MAX,
   MAX_ROUTED,
   ORCHESTRATOR_MODEL,
   ROUTE_SYSTEM,
@@ -840,7 +841,11 @@ async function dispatch($: EngineInterface) {
       await alertPerson($, `Task #${task.id} blocked: it waits for #${dead}, which was dropped`)
     }
   }
-  for (const { task, worker, inClone } of plan(await read($, tasks), await read($, workers))) {
+  // An idle worker whose context is already half full takes no new task: a compaction in the middle
+  // of one could summarise its brief away. A fresh session does, and the full one makes room.
+  const readings = await read($, usage)
+  const full = new Set(Object.entries(readings).filter(([, u]) => u.window > 0 && u.context / u.window > REUSE_CONTEXT_MAX).map(([name]) => name))
+  for (const { task, worker, inClone } of plan(await read($, tasks), await read($, workers), full)) {
     // The branch starts from: the one the person asked; else, after a task of the same repo,
     // that task's branch; else where the repo stood at its first task, not whatever task
     // branch the previous worker left checked out. A non-git target: no branch, no base.
@@ -911,7 +916,7 @@ async function dispatch($: EngineInterface) {
     const used = (await read($, workers)).map(w => w.name).concat((await read($, peers)).map(p => p.name))
     const name = workerName(task.role, task.repo, used)
     const { work } = task.sizing
-    const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo), work, brief)
+    const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo, await read($, self)), work, brief)
     if (!bgId) {
       await patchTask($, task.id, { state: 'blocked', report: 'worker launch failed' })
       await alertPerson($, `Task #${task.id} blocked: its worker session could not be launched`)
@@ -936,7 +941,7 @@ async function startReview($: EngineInterface, task: Task) {
   // Also for a task sized before the floor existed.
   const review = atLeast(task.sizing.review, SESSION_FLOOR)
   const brief = reviewBrief(me, task)
-  const bgId = await launch($, name, REVIEWER, reviewerAgent(task.repo), review, brief)
+  const bgId = await launch($, name, REVIEWER, reviewerAgent(task.repo, await read($, self)), review, brief)
   if (!bgId) {
     await patchTask($, task.id, { state: 'blocked', report: 'reviewer launch failed' })
     await alertPerson($, `Task #${task.id} blocked: its reviewer session could not be launched`)
@@ -1125,7 +1130,7 @@ async function replaceWorker($: EngineInterface, task: Task, text: string): Prom
   const name = workerName(task.role, task.repo, used)
   const { work } = task.sizing
   const brief = takeoverBrief(await read($, self), task, task.worker, text)
-  const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo), work, brief)
+  const bgId = await launch($, name, agentName(task.role), workerAgent(task.role, task.repo, await read($, self)), work, brief)
   if (!bgId) {
     return { worker: task.worker, isFresh: false, reason: `${task.worker} is gone and no new session could be launched` }
   }

@@ -1685,3 +1685,46 @@ test('the workspace practices reach every worker and reviewer; an inner workspac
     setWorkspaces(WORKSPACES)
   }
 })
+
+test('the report format and the orchestrator\'s name live in the agent definition, which no compaction summarises', () => {
+  const worker = JSON.parse(workerAgent('lead-backend', 'acme/core/acme-backend', 'app-22'))['orch-lead-backend'].prompt as string
+  expect(worker).toContain('also after your context was compacted: with SendMessage to the orchestrator, "app-22" (or the session a later [ORCH <name> …] message names)')
+  expect(worker).toContain('BRANCH: <the task branch, exactly as git names it>')
+  const stack = JSON.parse(workerAgent('platform-engineer', 'stack', 'app-22'))['orch-platform-engineer'].prompt as string
+  expect(stack).toContain('CHANGES: <every change made to the target')
+  expect(stack).not.toContain('BRANCH:')
+  const reviewer = JSON.parse(reviewerAgent('mtg', 'app-22'))['orch-reviewer'].prompt as string
+  expect(reviewer).toContain('VERDICT: APPROVED | CHANGES_REQUESTED')
+})
+
+test('an idle worker past half its context gets no new task', () => {
+  const idle: Worker = { name: 'w1', bgId: 'a', repo: 'acme/core/b', role: 'lead-backend', model: 'opus', effort: 'high', task: null }
+  const queued = [task(2, 'acme/core/b', 'queued')]
+  expect(plan(queued, [idle]).map(m => m.worker?.name)).toEqual(['w1'])
+  expect(plan(queued, [idle], new Set(['w1'])).map(m => m.worker)).toEqual([null])
+})
+
+test('dispatch reads the context of the idle workers before reusing one', async ($, on) => {
+  const { launched, onPython } = world(on)
+  mock.env(on, { HOME: '/home/test' })
+  on('session.id', () => ({ value: 'self0000-0000' }) as never)
+  on('fs.list', () => ({ value: [{ name: '00000001-aaaa.jsonl', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }) as never)
+  let context = 100_000
+  onPython(argv =>
+    String(argv[1]).endsWith('/usage.py')
+      ? JSON.stringify({ '/home/test/.claude/projects/-app/00000001-aaaa.jsonl': { model: 'claude-opus-5-5', context, turns: 1, input: 1, output: 1, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 } })
+      : '{}',
+  )
+  await orch($, 'task acme/core/acme-backend first')
+  await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/a')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  // A light worker is reused for the next task of its repo.
+  await orch($, 'task acme/core/acme-backend second')
+  expect(launched.filter(l => !l.name.startsWith('orch-review'))).toHaveLength(1)
+  await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/b')
+  await receive($, 'orch-review-2-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  // Past half its window, it is not: a fresh session takes the third task.
+  context = 600_000
+  await orch($, 'task acme/core/acme-backend third')
+  expect(launched.filter(l => !l.name.startsWith('orch-review')).map(l => l.name)).toEqual(['orch-lead-backend-acme-backend', 'orch-lead-backend-acme-backend-2'])
+})

@@ -382,7 +382,16 @@ const practiceLines = (repo: string, isReviewer: boolean): string[] => {
 const wsOf = (repo: string) => workspaceOf(repo) ?? targetOf(repo)?.ws ?? null
 
 /** What `--agents` takes for one worker role: the workspace's start lines point at its role cards. */
-export const workerAgent = (role: string, repo = ''): string => {
+/**
+ * How a session reports, in its agent definition: the system prompt is never compacted, so the
+ * format and the address outlive a compaction that summarised the brief away.
+ */
+const reportRules = (self: string, lines: readonly string[]): string[] => [
+  `How you report, every time, also after your context was compacted: with SendMessage to the orchestrator${self ? `, "${self}" (or the session a later [ORCH <name> …] message names)` : ', the session named in the [ORCH <name> …] header of your latest brief'}, in exactly this format, one field per line:`,
+  ...lines,
+]
+
+export const workerAgent = (role: string, repo = '', self = ''): string => {
   const ws = wsOf(repo)
   const values = { role, folder: roleFolder(role, repo || null), workspace: ws ? workspaceDir(ws) : ROOT }
   const card = repo ? roleCard(role, repo) : null
@@ -408,14 +417,14 @@ export const workerAgent = (role: string, repo = ''): string => {
     ...practiceLines(repo, false),
     ...personalityLines(repo ? characterFor(role, repo) : null),
     'Tasks arrive as cross-session messages from the orchestrator. One task at a time; stay inside the repo the brief names.',
-    'Always finish by replying with SendMessage to the orchestrator, in the exact report format the brief asks for.',
+    ...reportRules(self, isTarget(repo) ? STACK_REPORT : REPORT_LINES),
   ].join('\n')
 
   return JSON.stringify({ [agentName(role)]: { description: `Orchestrator worker: ${role}`, prompt } })
 }
 
 /** What `--agents` takes for the reviewer: generic rules, then the workspace's review rules. */
-export const reviewerAgent = (repo = ''): string => {
+export const reviewerAgent = (repo = '', self = ''): string => {
   const ws = wsOf(repo)
   const prompt = [
     'You are the code reviewer of an orchestrator session. You review; you never edit, commit, push, or comment on GitHub.',
@@ -424,7 +433,7 @@ export const reviewerAgent = (repo = ''): string => {
     ...reviewDocLines(repo),
     ...practiceLines(repo, true),
     ...personalityLines(repo ? reviewerCharacter(repo) : null),
-    'Always finish by replying with SendMessage to the orchestrator, in the exact verdict format the brief asks for.',
+    ...reportRules(self, ['VERDICT: APPROVED | CHANGES_REQUESTED', 'FINDINGS:', '- 🔴|🟠|⚪ <file:line or what was checked> — <problem> — <expected fix>']),
   ].join('\n')
 
   return JSON.stringify({ [REVIEWER]: { description: 'Orchestrator reviewer', prompt } })
@@ -449,6 +458,16 @@ const targetRules = (task: Task): string[] => [
   ...(targetOf(task.repo)?.target.worker ?? []).map(line => `- ${line}`),
   '- Before anything that destroys or cannot be undone, save what it would lose first, or report STATUS: blocked and ask in NEEDS.',
   '- Keep a log of every command that changed something, and how to undo it. Check the outcome on the target before reporting.',
+]
+
+/** What a worker reports on a repo task. */
+const REPORT_LINES = [
+  'STATUS: done | blocked | failed',
+  'SUMMARY: <2-5 lines>',
+  'BRANCH: <the task branch, exactly as git names it>',
+  'CHANGES: <branch, commits>',
+  'TESTS: <what ran, result>',
+  'NEEDS: <decision required from the person, if any>',
 ]
 
 const STACK_REPORT = [
@@ -776,7 +795,10 @@ export const parsePr = (reply: string): { title: string; body: string } | null =
  * main checkout and, when its workspace allows more at once, the others in local clones (`inClone`).
  * A task gets an idle worker of its repo, role, model and effort (main checkout only), or `null`: launch one.
  */
-export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Worker | null; inClone: boolean }[] => {
+/** Past this share of its context window, an idle worker is not given another task: a fresh session is. */
+export const REUSE_CONTEXT_MAX = 0.5
+
+export const plan = (tasks: Task[], workers: Worker[], full: ReadonlySet<string> = new Set()): { task: Task; worker: Worker | null; inClone: boolean }[] => {
   const active = tasks.filter(t => ACTIVE.includes(t.state))
   const running = new Map<string, number>()
   const mainBusy = new Set<string>()
@@ -801,6 +823,7 @@ export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Wo
           w =>
             w.task === null &&
             !taken.has(w.name) &&
+            !full.has(w.name) &&
             w.repo === task.repo &&
             w.role === task.role &&
             w.model === task.sizing.work.model &&

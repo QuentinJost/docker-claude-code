@@ -29,7 +29,9 @@ built-in transport (`claude --bg`, `SendMessage`, `ListAgents`): no daemon.
    git repo gets `git init` and an empty first commit, local only; a folder that does not exist,
    or that sits inside another repo, blocks the task.
 3. **Work.** The worker gets its brief and reports `STATUS / SUMMARY / BRANCH / CHANGES / TESTS /
-   NEEDS` with `SendMessage`.
+   NEEDS` with `SendMessage`. The report format and the orchestrator's name are also in its agent
+   definition, which a compaction never summarises. An idle worker past half its context window is
+   not given another task: a fresh session is.
 4. **Checks.** The commands the workspace names (`checks`) run in the repo before any review; a
    failure goes back to the worker with its output (twice at most), and spares a review session.
 5. **Review.** A fresh reviewer session per round returns `VERDICT / FINDINGS`. Three rejected
