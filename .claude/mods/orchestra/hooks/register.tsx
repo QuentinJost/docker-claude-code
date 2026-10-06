@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { RepoInfo } from './pipeline'
-import type { FeedEntry, Peer, WorkerUsage, Setting, Sizing, Task, TaskState, Worker } from '../types'
-import { dollars, fillBar, tokens, toUsage } from './usage'
+import type { RepoInfo, RoutedTask } from './pipeline'
+import type { FeedEntry, HistoryEntry, Peer, WorkerUsage, Setting, Sizing, Task, TaskState, Worker } from '../types'
+import { callCost, dollars, fillBar, tokens, toUsage } from './usage'
 import type { TranscriptTotals } from './usage'
 import { BADGE, STATES, ago, lastFindings, ordered, reportLine, roundDots } from './view'
 import { body, deliveryFailure, isAutoModeHold, oneLine, parseBackgrounded, parseInbound, parseListing } from './parse'
@@ -42,6 +42,9 @@ import {
   reviewerAgent,
   reworkBrief,
   answerBrief,
+  checksBrief,
+  followupText,
+  taskDir,
   doneDigest,
   takeoverBrief,
   roleFor,
@@ -51,7 +54,7 @@ import {
   workerBrief,
   workerName,
 } from './pipeline'
-import { ROOT, allWorkspaces, isTarget, parseWorkspaces, setWorkspaces, targetNames, workspaceDir } from './workspace'
+import { ROOT, allWorkspaces, checkTimeoutMs, checksFor, describe, isKnownRole, isTarget, parseWorkspaces, setWorkspaces, targetNames, workspaceDir, workspaceErrors } from './workspace'
 
 const PANE = 'orchestra'
 const PANE_BACKGROUND = 'bashMessageBackgroundColor'
@@ -72,6 +75,20 @@ const showDone = atom({ plugin: 'orchestra', key: 'showDone' } as const, false)
 const usage = atom({ plugin: 'orchestra', key: 'usage' } as const, {} as Record<string, WorkerUsage>)
 const remoteSeen = atom({ plugin: 'orchestra', key: 'remoteSeen' } as const, false)
 const reminded = atom({ plugin: 'orchestra', key: 'reminded' } as const, false)
+const pending = atom({ plugin: 'orchestra', key: 'pending' } as const, null as { input: string; questions: string[] } | null)
+
+/** The checks start this long after the report, from a timer. */
+const CHECK_START_MS = 10
+/** Times a task's own checks may send it back before the person is asked. */
+const MAX_CHECK_FIXES = 2
+/** Lines of a failing check's output the worker is shown. */
+const CHECK_OUTPUT_LINES = 60
+/** Past tasks kept for sizing. */
+const HISTORY_MAX = 300
+/** Where the parallel tasks' clones live: hidden, so the repo listing skips them. */
+const CLONES = `${ROOT}/.orchestra/clones`
+/** The identity of the first commit the orchestrator makes in a folder it turns into a repo, when git has none. */
+const INIT_IDENTITY = ['-c', 'user.name=Orchestra', '-c', 'user.email=orchestra@localhost']
 
 /**
  * Said once per session, when the first task is queued, unless a prompt already came in through
@@ -308,8 +325,9 @@ async function retire($: EngineInterface, worker: Worker) {
 /** Asks the orchestrator's model which model and effort the task's sessions need; `forced` wins for the development. */
 async function size($: EngineInterface, repo: string, role: string, text: string, forced: Partial<Setting>) {
   const reply = await $.model
-    .complete({ model: ORCHESTRATOR_MODEL, system: SIZING_SYSTEM, prompt: sizingPrompt(repo, role, text), maxTokens: 400, effort: 'medium' })
+    .complete({ model: ORCHESTRATOR_MODEL, system: SIZING_SYSTEM, prompt: sizingPrompt(repo, role, text, await readHistory($)), maxTokens: 400, effort: 'medium' })
     .catch(() => null)
+  const spent = reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0
   const sized: Sizing = (reply?.isAnswered ? parseSizing(reply.text) : null) ?? defaultSizing(role, repo)
   const asked = { ...sized.work, ...forced }
   const work = atLeast(asked, WORK_FLOOR)
@@ -320,11 +338,68 @@ async function size($: EngineInterface, repo: string, role: string, text: string
   ].filter(Boolean)
   const why = raised.length > 0 ? `${sized.why} (${raised.join('; ')})` : sized.why
 
-  return { work, review, why }
+  return { sizing: { work, review, why }, spent }
+}
+
+/** Where the past tasks are kept, across sessions. */
+async function historyFile($: EngineInterface) {
+  const config =
+    (await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) ?? `${(await $.env.get('HOME').catch(() => undefined)) ?? ''}/.claude`
+  return `${config}/orchestra/history.json`
+}
+
+async function readHistory($: EngineInterface): Promise<HistoryEntry[]> {
+  try {
+    const list = JSON.parse(await $.fs.read(await historyFile($))) as unknown
+    return Array.isArray(list) ? (list as HistoryEntry[]) : []
+  } catch {
+    return []
+  }
+}
+
+/** What a task cost so far: its sessions (live or retired) and the orchestrator's calls for it. */
+async function costOf($: EngineInterface, task: Task): Promise<number> {
+  const used = await read($, usage)
+  return (
+    Object.entries(used)
+      .filter(([name, u]) => u.task === task.id || name === task.worker || name.startsWith(`orch-review-${task.id}-`))
+      .reduce((sum, [, u]) => sum + u.cost, 0) + (task.callCost ?? 0)
+  )
+}
+
+/** Keeps a finished task for the sizing of the next ones. Best effort: a failure loses one entry, never the task. */
+async function remember($: EngineInterface, task: Task, outcome: HistoryEntry['outcome']) {
+  await keep($, task, outcome).catch(() => undefined)
+}
+
+async function keep($: EngineInterface, task: Task, outcome: HistoryEntry['outcome']) {
+  await refreshUsage($).catch(() => undefined)
+  const entry: HistoryEntry = {
+    at: await $.clock.now(),
+    repo: task.repo,
+    role: task.role,
+    title: firstLine(task.text),
+    work: task.sizing.work,
+    review: task.sizing.review,
+    outcome,
+    rounds: task.round,
+    checkFixes: task.checkFixes ?? 0,
+    cost: await costOf($, task),
+  }
+  const history = [...(await readHistory($)), entry].slice(-HISTORY_MAX)
+  await $.fs.write(await historyFile($), JSON.stringify(history, null, 1)).catch(() => undefined)
+}
+
+/** Adds the cost of an orchestrator model call to a task. */
+async function charge($: EngineInterface, id: number, cost: number) {
+  if (cost > 0) {
+    const task = (await read($, tasks)).find(t => t.id === id)
+    await patchTask($, id, { callCost: (task?.callCost ?? 0) + cost })
+  }
 }
 
 /** What a typed task holds: `<repo> <description> [@role] [model:… effort:…] [after:#n] [from:<branch>]`. */
-type Input = { repo: string; role: string; text: string; work: Partial<Setting>; after: number[]; from: string }
+type Input = { repo: string; role: string; text: string; work: Partial<Setting>; after: number[]; from: string; spent?: number }
 
 const parseInput = (input: string): Input | null => {
   const parsed = parseTask(input)
@@ -378,7 +453,7 @@ async function queueTask($: EngineInterface, input: Input): Promise<{ id: number
     return { error: refused }
   }
   const { repo, role, text, work, after, from } = input
-  const sizing = await size($, repo, role, text, work)
+  const { sizing, spent } = await size($, repo, role, text, work)
   const at = await $.clock.now()
   const list = await read($, tasks)
   const id = list.reduce((max, t) => Math.max(max, t.id), 0) + 1
@@ -397,6 +472,7 @@ async function queueTask($: EngineInterface, input: Input): Promise<{ id: number
     sizing,
     reviews: [],
     updatedAt: at,
+    callCost: spent + (input.spent ?? 0),
     ...(after.length > 0 ? { after } : {}),
     ...(from ? { from } : {}),
   }
@@ -443,23 +519,33 @@ async function upgradeTask($: EngineInterface, input: string): Promise<string> {
   const reply = await $.model
     .complete({ model: ORCHESTRATOR_MODEL, system: UPGRADE_SYSTEM, prompt: upgradePrompt(parsed.repo, parsed.role, parsed.text), maxTokens: 2000, effort: 'high' })
     .catch(() => null)
-  const upgrade = reply?.isAnswered ? parseUpgrade(reply.text) : null
+  const spent = reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0
+  const upgrade = reply?.isAnswered ? parseUpgrade(reply.text, parsed.repo) : null
   if (!upgrade) {
     await log($, { direction: 'notice', peer: 'prompt', text: `no usable brief from ${ORCHESTRATOR_MODEL}; nothing queued` })
     return `The orchestrator model gave no usable brief; nothing queued. Retry, or queue it as typed with /orch task.`
   }
   if ('questions' in upgrade) {
     await log($, { direction: 'notice', peer: 'prompt', text: `unclear request, ${upgrade.questions.length} question(s) for you; nothing queued` })
-    return ['Not queued: the request needs settling first.', ...upgrade.questions.map(q => `- ${q}`), '', 'Answer in a new /orch prompt.'].join('\n')
+    await update($, pending, () => ({ input, questions: upgrade.questions }))
+    return ['Not queued: the request needs settling first.', ...upgrade.questions.map(q => `- ${q}`), '', 'Answer with /orch answer <your answers>.'].join('\n')
+  }
+  await update($, pending, () => null)
+  // The role the person named (one other than the repo's own) wins; else the one the model picked, when the repo knows it.
+  const isNamed = parsed.role !== roleFor(parsed.repo, '').role
+  const pick = (role?: string) => (isNamed || !role || !isKnownRole(role, parsed.repo) ? parsed.role : role)
+  if ('tasks' in upgrade) {
+    return queueRouted($, upgrade.tasks.map(t => ({ ...t, role: pick(t.role) })), { work: parsed.work, after: parsed.after }, spent, parsed.text)
   }
   const text = `${upgrade.title}\n\n${upgrade.brief}`
-  const queued = await queueTask($, { ...parsed, text })
+  const role = pick(upgrade.role)
+  const queued = await queueTask($, { ...parsed, role, text, spent })
   if ('error' in queued) {
     return `Not queued: ${queued.error}.`
   }
   await log($, { direction: 'notice', peer: `#${queued.id}`, text: `brief written by the Prompt Manager from: ${oneLine(parsed.text)}` })
 
-  return [`Task #${queued.id} queued in ${parsed.repo} for ${parsed.role} with this brief:`, queued.lines, '', text].join('\n')
+  return [`Task #${queued.id} queued in ${parsed.repo} for ${role} with this brief:`, queued.lines, '', text].join('\n')
 }
 
 /** The git repositories under the workspace root, with a line on each (hooks/repos.py); empty when unreadable. */
@@ -480,8 +566,18 @@ async function listRepos($: EngineInterface): Promise<RepoInfo[]> {
  */
 async function loadWorkspaces($: EngineInterface) {
   const ran = await exec($, ['python3', `${$.plugin.root}/hooks/repos.py`, '--workspaces', ROOT]).catch(() => null)
-  setWorkspaces(parseWorkspaces(ran?.stdout ?? ''))
+  const parsed = parseWorkspaces(ran?.stdout ?? '')
+  setWorkspaces(parsed.workspaces, parsed.errors)
+  // Each fault once in the feed: a broken file changes what the orchestra does, silently otherwise.
+  const seen = new Set((await read($, feed)).filter(f => f.peer === 'config').map(f => f.text))
+  for (const error of parsed.errors.filter(e => !seen.has(e))) {
+    await notify($, 'config', error)
+  }
 }
+
+/** What /orch adds to every answer while a workspace file is faulty. */
+const configWarning = (): string =>
+  workspaceErrors().length ? ['', '⚠ Workspace config:', ...workspaceErrors().map(e => `- ${e}`), 'See /orch config.'].join('\n') : ''
 
 /** The overviews the router reads beside the repo list: the files each workspace names. */
 async function workspaceOverview($: EngineInterface): Promise<string> {
@@ -509,6 +605,7 @@ async function routeTask($: EngineInterface, input: string, repos: RepoInfo[]): 
   const reply = await $.model
     .complete({ model: ORCHESTRATOR_MODEL, system: ROUTE_SYSTEM, prompt: routePrompt(repos, await workspaceOverview($), role, request), maxTokens: 4000, effort: 'high' })
     .catch(() => null)
+  const spent = reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0
   const routed = reply?.isAnswered ? parseRouting(reply.text, repos) : null
   if (!routed) {
     await log($, { direction: 'notice', peer: 'prompt', text: `no usable routing from ${ORCHESTRATOR_MODEL}; nothing queued` })
@@ -516,30 +613,116 @@ async function routeTask($: EngineInterface, input: string, repos: RepoInfo[]): 
   }
   if ('questions' in routed) {
     await log($, { direction: 'notice', peer: 'prompt', text: `request not placed, ${routed.questions.length} question(s) for you; nothing queued` })
-    return ['Not queued: the request needs settling first.', ...routed.questions.map(q => `- ${q}`), '', 'Answer in a new /orch prompt, or name the repo: /orch prompt <repo> <request>.'].join('\n')
+    await update($, pending, () => ({ input, questions: routed.questions }))
+    return ['Not queued: the request needs settling first.', ...routed.questions.map(q => `- ${q}`), '', 'Answer with /orch answer <your answers>, or name the repo: /orch prompt <repo> <request>.'].join('\n')
   }
+  await update($, pending, () => null)
+  // The role the person named wins; else the one the model picked, when the repo knows it; else the repo's.
+  const tasksWithRoles = routed.tasks.map(t => ({
+    ...t,
+    role: role ?? (t.role && isKnownRole(t.role, t.repo) ? t.role : roleFor(t.repo, '').role),
+  }))
+  return queueRouted($, tasksWithRoles, overrides, spent, request)
+}
+
+/**
+ * Queues the tasks the model made of one request (several repos, or several domains of one repo),
+ * in its order: its `after` positions become the ids queued so far.
+ */
+async function queueRouted(
+  $: EngineInterface,
+  list: (RoutedTask & { role: string })[],
+  overrides: { work: Partial<Setting>; after: number[] },
+  spent: number,
+  request: string,
+): Promise<string> {
   const answers: string[] = []
-  // The model's `after` points at positions in its list; they become the ids queued so far.
   const ids: (number | undefined)[] = []
-  for (const [index, { repo, title, brief, after }] of routed.tasks.entries()) {
+  for (const [index, { repo, title, brief, after, role }] of list.entries()) {
     const text = `${title}\n\n${brief}`
-    const taskRole = role ?? roleFor(repo, '').role
     const waits = [...new Set([...overrides.after, ...after.map(i => ids[i]).filter((n): n is number => n !== undefined)])]
-    const queued = await queueTask($, { repo, role: taskRole, text, work: overrides.work, after: waits, from: '' })
+    const queued = await queueTask($, { repo, role, text, work: overrides.work, after: waits, from: '', spent: spent / list.length })
     if ('error' in queued) {
       answers.push(`Not queued in ${repo}: ${queued.error}.`)
       ids[index] = undefined
       continue
     }
     ids[index] = queued.id
-    await log($, { direction: 'notice', peer: `#${queued.id}`, text: `routed to ${repo} by the Prompt Manager from: ${oneLine(request)}` })
-    answers.push([`Task #${queued.id} queued in ${repo} for ${taskRole} with this brief:`, queued.lines, '', text].join('\n'))
+    await log($, { direction: 'notice', peer: `#${queued.id}`, text: `${role} task in ${repo}, from: ${oneLine(request)}` })
+    answers.push([`Task #${queued.id} queued in ${repo} for ${role} with this brief:`, queued.lines, '', text].join('\n'))
   }
-  if (routed.tasks.length === MAX_ROUTED) {
+  if (list.length === MAX_ROUTED) {
     answers.push(`(${MAX_ROUTED} tasks at most per request.)`)
   }
 
   return answers.join('\n\n')
+}
+
+/**
+ * Makes a task's folder a repo it can branch from: a folder that is not a git repo gets `git init`
+ * and an empty first commit, a repo with no commit yet the empty commit. Local only: no remote, no
+ * hosting. The reason it cannot, or whether the folder just became a repo: a new app, with its rules.
+ */
+async function ensureRepo($: EngineInterface, repo: string): Promise<string | { isNew: boolean }> {
+  const dir = `${ROOT}/${repo}`
+  if (!(await $.fs.exists(dir).catch(() => false))) {
+    return `${dir} does not exist: create the folder (or fix the name), then /orch retry`
+  }
+  const git = (...args: string[]) => exec($, ['git', '-C', dir, ...args])
+  const top = (await git('rev-parse', '--show-toplevel')).stdout.trim()
+  // A subfolder of another repo is not made a repo of its own: the task belongs to that repo.
+  if (top !== '' && top !== dir) {
+    return `${dir} is inside the repo ${top}: queue the task on that repo instead`
+  }
+  let isNew = false
+  if (top === '') {
+    isNew = true
+    const init = await git('init', '--quiet', '--initial-branch=main')
+    if (init.exitCode !== 0) {
+      return `${dir} is not a git repo and git init failed: ${oneLine(init.stderr).slice(0, 200)}`
+    }
+    await log($, { direction: 'notice', peer: repo, text: 'not a git repo: git init (local only, no remote)' })
+  }
+  if ((await git('rev-parse', '--verify', '--quiet', 'HEAD')).exitCode !== 0) {
+    const hasIdentity = (await git('config', 'user.email')).stdout.trim() !== ''
+    const commit = await exec($, ['git', '-C', dir, ...(hasIdentity ? [] : INIT_IDENTITY), 'commit', '--allow-empty', '--quiet', '-m', 'chore: initial commit'])
+    if (commit.exitCode !== 0) {
+      return `${dir} has no commit and the first one failed: ${oneLine(commit.stderr).slice(0, 200)}`
+    }
+    await log($, { direction: 'notice', peer: repo, text: 'no commit yet: empty first commit made, for the task branch to start from' })
+    isNew = true
+  }
+  return { isNew }
+}
+
+/** A local clone of a task's repo for it alone, on its start branch; its path, or null. */
+async function cloneFor($: EngineInterface, task: Task, branchFrom: string, base: string): Promise<string | null> {
+  const dir = `${CLONES}/${task.repo.replace(/[^A-Za-z0-9._-]/g, '-')}-${task.id}`
+  await exec($, ['rm', '-rf', dir])
+  const cloned = await exec($, ['git', 'clone', '--quiet', '--no-checkout', `${ROOT}/${task.repo}`, dir], ROOT, 600_000)
+  if (cloned.exitCode !== 0) {
+    await log($, { direction: 'notice', peer: `#${task.id}`, text: `clone failed: ${oneLine(cloned.stderr).slice(0, 200)}` })
+    return null
+  }
+  const placed = await exec($, ['git', '-C', dir, 'switch', '--quiet', '-C', branchFrom || 'main', base])
+  if (placed.exitCode !== 0) {
+    return null
+  }
+  await log($, { direction: 'notice', peer: `#${task.id}`, text: `works in a local clone: ${dir}` })
+  return dir
+}
+
+/** Brings an approved clone task's branch back into the repo, then removes the clone. The reason it could not, or null. */
+async function bringBack($: EngineInterface, task: Task): Promise<string | null> {
+  if (!task.dir || !task.branch) {
+    return task.dir ? 'its report named no branch: the clone is kept' : null
+  }
+  const fetched = await exec($, ['git', '-C', `${ROOT}/${task.repo}`, 'fetch', '--quiet', task.dir, `${task.branch}:${task.branch}`])
+  if (fetched.exitCode !== 0) {
+    return `the branch could not be fetched back (${oneLine(fetched.stderr).slice(0, 200)}): the clone is kept at ${task.dir}`
+  }
+  await exec($, ['rm', '-rf', task.dir])
+  return null
 }
 
 /** Gives every queued task that can start a worker: an idle one of its repo and role, or a new session. */
@@ -561,12 +744,22 @@ async function dispatch($: EngineInterface) {
       await alertPerson($, `Task #${task.id} blocked: it waits for #${dead}, which was dropped`)
     }
   }
-  for (const { task, worker } of plan(await read($, tasks), await read($, workers))) {
+  for (const { task, worker, inClone } of plan(await read($, tasks), await read($, workers))) {
     // The branch starts from: the one the person asked; else, after a task of the same repo,
     // that task's branch; else where the repo stood at its first task, not whatever task
     // branch the previous worker left checked out. A non-git target: no branch, no base.
     const all = await read($, tasks)
     const git = (...args: string[]) => exec($, ['git', '-C', `${ROOT}/${task.repo}`, ...args])
+    let isNewApp = task.isNewApp ?? false
+    if (!isTarget(task.repo)) {
+      const ready = await ensureRepo($, task.repo)
+      if (typeof ready === 'string') {
+        await patchTask($, task.id, { state: 'blocked', report: blockedReport(ready) })
+        await notify($, `#${task.id}`, `blocked: ${ready}`)
+        continue
+      }
+      isNewApp ||= ready.isNew
+    }
     const sameRepoDep = (task.after ?? []).map(id => all.find(t => t.id === id)).find(t => t?.repo === task.repo && t.branch)
     const branchFrom = isTarget(task.repo)
       ? ''
@@ -576,21 +769,24 @@ async function dispatch($: EngineInterface) {
           (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim())
     const head = isTarget(task.repo) ? { exitCode: 0, stdout: '' } : await git('rev-parse', branchFrom || 'HEAD')
     if (head.exitCode !== 0) {
-      // A repo whose branch has no commit yet has no HEAD either: say so, not "not a repo".
-      const isRepo = (await git('rev-parse', '--git-dir')).exitCode === 0
-      const why = isRepo
-        ? `${ROOT}/${task.repo} has no commit to branch from${task.from ? ` (${task.from})` : ''}: make a first commit, then /orch retry ${task.id}`
-        : `${ROOT}/${task.repo} is not a git repository${targetNames().length ? ` (non-git targets: ${targetNames().join(', ')})` : ''}`
+      const why = `${ROOT}/${task.repo}: no branch or commit "${branchFrom || 'HEAD'}" to start from`
+      await patchTask($, task.id, { state: 'blocked', report: blockedReport(why) })
+      await notify($, `#${task.id}`, `blocked: ${why}`)
+      continue
+    }
+    const base = head.stdout.trim()
+    // Beside another task of the same repo: a local clone of its own, on the start branch.
+    const dir = inClone ? await cloneFor($, task, branchFrom, base) : ''
+    if (dir === null) {
+      const why = `${ROOT}/${task.repo}: the local clone for a parallel task could not be made`
       await patchTask($, task.id, { state: 'blocked', report: blockedReport(why) })
       await notify($, `#${task.id}`, `blocked: ${why}`)
       continue
     }
     const prior = priorNote(task, all)
-    const started: Task = { ...task, state: 'working', branchFrom, base: head.stdout.trim(), ...(prior ? { prior } : {}) }
+    const started: Task = { ...task, state: 'working', branchFrom, base, ...(dir ? { dir } : {}), ...(prior ? { prior } : {}), ...(isNewApp ? { isNewApp } : {}) }
     const brief = workerBrief(me, started)
-    if (prior) {
-      await patchTask($, task.id, { prior })
-    }
+    await patchTask($, task.id, { ...(prior ? { prior } : {}), ...(dir ? { dir } : {}), ...(isNewApp ? { isNewApp } : {}) })
 
     if (worker) {
       await patchTask($, task.id, { state: 'working', branchFrom, base: started.base, worker: worker.name })
@@ -663,10 +859,18 @@ async function onWorkerReport($: EngineInterface, worker: Worker, text: string) 
   if (status === 'done') {
     // The task branch, for the next task that builds on it and for /orch pr: the report's
     // BRANCH line, else the branch the repo is on when it differs from the start.
-    const current = isTarget(task.repo) ? '' : (await exec($, ['git', '-C', `${ROOT}/${task.repo}`, 'branch', '--show-current'])).stdout.trim()
+    const current = isTarget(task.repo) ? '' : (await exec($, ['git', '-C', taskDir(task), 'branch', '--show-current'])).stdout.trim()
     const branch = parseBranch(text) || (current !== task.branchFrom ? current : '')
     const reported = { ...task, report: body(text), ...(branch ? { branch } : {}) }
     await patchTask($, task.id, { report: reported.report, ...(branch ? { branch } : {}) })
+    const checks = isTarget(task.repo) ? [] : checksFor(task.repo)
+    if (checks.length > 0) {
+      // Long: run from a timer, outside the queue's turn, so other tasks keep moving; the outcome comes back in it.
+      await patchTask($, task.id, { state: 'checking' })
+      await notify($, `#${task.id}`, `running ${checks.length} check(s) before review`)
+      $.clock.after(CHECK_START_MS, () => runChecks($, reported, checks).then(outcome => serial(() => onChecksDone($, task.id, checks, outcome))))
+      return
+    }
     await startReview($, reported)
     return
   }
@@ -674,6 +878,65 @@ async function onWorkerReport($: EngineInterface, worker: Worker, text: string) 
   await notify($, `#${task.id}`, `${status}: needs you (/orch retry ${task.id} <answer> or /orch drop ${task.id})`)
   const needs = parseNeeds(body(text))
   await alertPerson($, `Task #${task.id} ${status} in ${task.repo}${needs ? `: ${needs}` : ''}`)
+}
+
+type CheckOutcome = { failed: string; output: string } | null
+
+/**
+ * Runs a repo's checks in the task's folder, on its branch, one after the other, stopping at the
+ * first failure: the failing command and the end of its output, or null when all pass.
+ */
+async function runChecks($: EngineInterface, task: Task, checks: string[]): Promise<CheckOutcome> {
+  const dir = taskDir(task)
+  if (task.branch) {
+    const on = (await exec($, ['git', '-C', dir, 'branch', '--show-current'])).stdout.trim()
+    if (on !== task.branch) {
+      const switched = await exec($, ['git', '-C', dir, 'switch', '--quiet', task.branch])
+      if (switched.exitCode !== 0) {
+        return { failed: `git switch ${task.branch}`, output: `The repo is on ${on || 'a detached HEAD'}, and the task branch could not be checked out:\n${switched.stderr}` }
+      }
+    }
+  }
+  for (const command of checks) {
+    const ran = await exec($, ['sh', '-c', command], dir, checkTimeoutMs(task.repo))
+    if (ran.exitCode !== 0) {
+      const output = `${ran.stdout}\n${ran.stderr}`.trim().split('\n').slice(-CHECK_OUTPUT_LINES).join('\n').slice(-6000)
+      return { failed: command, output: output || `exit code ${ran.exitCode}, no output` }
+    }
+  }
+  return null
+}
+
+/** The checks' outcome: on to the review, or back to the worker, or, after too many tries, to the person. */
+async function onChecksDone($: EngineInterface, id: number, checks: string[], outcome: CheckOutcome) {
+  const task = (await read($, tasks)).find(t => t.id === id)
+  if (!task || task.state !== 'checking') {
+    return
+  }
+  if (outcome === null) {
+    const passed = { ...task, checks: checks.join(' && ') }
+    await patchTask($, id, { checks: passed.checks })
+    await notify($, `#${id}`, 'checks passed: on to review')
+    await startReview($, passed)
+    return
+  }
+  const fixes = task.checkFixes ?? 0
+  if (fixes >= MAX_CHECK_FIXES) {
+    await patchTask($, id, {
+      state: 'blocked',
+      report: blockedReport(`\`${outcome.failed}\` still fails after ${fixes} fix(es) by the worker:\n${outcome.output.split('\n').slice(-15).join('\n')}`),
+    })
+    await notify($, `#${id}`, `checks still fail after ${fixes} fixes: your call`)
+    await alertPerson($, `Task #${id} blocked: its checks still fail after ${fixes} fixes`)
+    return
+  }
+  await patchTask($, id, { state: 'working', checkFixes: fixes + 1 })
+  await notify($, `#${id}`, `check failed (${outcome.failed}): back to the worker, no review spent`)
+  const { reason } = await briefWorker($, task, checksBrief(await read($, self), task, outcome.failed, outcome.output))
+  if (reason !== null) {
+    await patchTask($, id, { state: 'blocked', report: blockedReport(`the failed checks reached no worker: ${reason}`) })
+    await alertPerson($, `Task #${id} blocked: the failed checks reached no worker`)
+  }
 }
 
 /** Moves the task on a verdict; on approval, answers the digest the model is handed. */
@@ -693,6 +956,11 @@ async function onReviewerReport($: EngineInterface, reviewer: Worker, text: stri
   if (verdict.isApproved) {
     await patchTask($, task.id, { state: 'approved', reviews })
     await patchWorker($, task.worker, { task: null })
+    const kept = await bringBack($, task)
+    if (kept) {
+      await notify($, `#${task.id}`, kept)
+    }
+    await remember($, { ...task, reviews }, 'approved')
     const needs = parseNeeds(task.report)
     await notify($, `#${task.id}`, needs ? `approved at round ${task.round}; open question for you: ${needs}` : `approved at round ${task.round}`)
     await alertPerson($, `Task #${task.id} approved in ${task.repo}${needs ? `; open question: ${needs}` : ''}`)
@@ -701,6 +969,7 @@ async function onReviewerReport($: EngineInterface, reviewer: Worker, text: stri
   }
   if (task.round >= MAX_ROUNDS) {
     await patchTask($, task.id, { state: 'escalated', reviews })
+    await remember($, { ...task, reviews }, 'escalated')
     await notify($, `#${task.id}`, `rejected ${MAX_ROUNDS} times: your call (/orch retry ${task.id} <note> or /orch drop ${task.id})`)
     await alertPerson($, `Task #${task.id} rejected ${MAX_ROUNDS} times in review: your call`)
     return
@@ -809,6 +1078,12 @@ async function dropTask($: EngineInterface, id: number) {
     await retire($, reviewer)
   }
   await patchTask($, id, { state: 'dropped' })
+  if (task.state !== 'queued') {
+    await remember($, task, 'dropped')
+  }
+  if (task.dir) {
+    await notify($, `#${id}`, `its clone is kept at ${task.dir}; remove it when done`)
+  }
   if (task.worker) {
     await patchWorker($, task.worker, { task: null })
   }
@@ -906,6 +1181,9 @@ async function prTask($: EngineInterface, id: number, isConfirmed: boolean): Pro
     return `Task #${id}: its report named no branch, so there is nothing to push. Open the pull request by hand.`
   }
   const dir = `${ROOT}/${task.repo}`
+  if ((await exec($, ['git', '-C', dir, 'remote', 'get-url', 'origin'])).exitCode !== 0) {
+    return `Task #${id}: ${task.repo} is a local repo with no remote (origin): nothing to push, no pull request. Its work is on branch ${task.branch || '(see the report)'}.`
+  }
   if (!isConfirmed) {
     const commits = (await exec($, ['git', '-C', dir, 'log', '--oneline', `${task.base || task.branchFrom}..${task.branch}`])).stdout.trim()
     if (!commits) {
@@ -914,6 +1192,7 @@ async function prTask($: EngineInterface, id: number, isConfirmed: boolean): Pro
     const reply = await $.model
       .complete({ model: ORCHESTRATOR_MODEL, system: PR_SYSTEM, prompt: prPrompt(task, commits), maxTokens: 2000, effort: 'medium' })
       .catch(() => null)
+    await charge($, id, reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0)
     const draft = (reply?.isAnswered ? parsePr(reply.text) : null) ?? { title: firstLine(task.text).slice(0, 72), body: `${task.report}\n\n${PR_FOOTER}` }
     await patchTask($, id, { prDraft: draft })
     return [
@@ -953,6 +1232,28 @@ async function prTask($: EngineInterface, id: number, isConfirmed: boolean): Pro
   return `Task #${id}: ${task.branch} pushed and pull request opened: ${url}`
 }
 
+/** `/orch followup <id> [note]`: a new task on an approved one's remaining review remarks, from its branch. */
+async function followupTask($: EngineInterface, id: number, note: string): Promise<string> {
+  const task = (await read($, tasks)).find(t => t.id === id)
+  if (!task || task.state !== 'approved') {
+    return `Task #${id} ${task ? `is ${task.state}` : 'does not exist'}: only an approved task gets a follow-up.`
+  }
+  const from = isTarget(task.repo) ? '' : task.branch ?? ''
+  const queued = await queueTask($, { repo: task.repo, role: task.role, text: followupText(task, note), work: {}, after: [], from })
+  return 'error' in queued ? `Not queued: ${queued.error}.` : `Follow-up of #${id} queued as #${queued.id} in ${task.repo}.\n${queued.lines}`
+}
+
+/** `/orch config [<repo>]`: the workspace files found, their faults, and what applies to a repo. */
+async function configReport($: EngineInterface, repo: string): Promise<string> {
+  const files = allWorkspaces().map(ws => `- ${ws.path} (${ws.file ?? 'orchestra.json'})`)
+  return [
+    `Workspaces under ${ROOT}: ${files.length ? '' : 'none, every repo gets the generic rules'}`,
+    ...files,
+    ...(workspaceErrors().length ? ['', 'Faults (the faulty part is ignored):', ...workspaceErrors().map(e => `- ${e}`)] : []),
+    ...(repo ? ['', ...describe(repo.replace(new RegExp(`^${ROOT}/`), '').replace(/\/$/, ''))] : ['', 'Add a repo to see what applies to it: /orch config <repo>.']),
+  ].join('\n')
+}
+
 async function runCommand($: EngineInterface, args: string) {
   const [verb = '', ...rest] = args.trim().split(/\s+/)
   const id = Number(rest[0])
@@ -982,6 +1283,21 @@ async function runCommand($: EngineInterface, args: string) {
     }
     case 'retry':
       return serial(() => retryTask($, id, rest.slice(1).join(' ')))
+    case 'followup':
+      return serial(() => followupTask($, id, rest.slice(1).join(' ')))
+    case 'answer': {
+      const asked = await read($, pending)
+      if (!asked) {
+        return 'No question is waiting for an answer.'
+      }
+      if (rest.length === 0) {
+        return 'Usage: /orch answer <your answers>'
+      }
+      const input = [asked.input, '', 'Answers to the questions asked about this request:', ...asked.questions.map(q => `- ${q}`), `→ ${rest.join(' ')}`].join('\n')
+      return serial(() => upgradeTask($, input))
+    }
+    case 'config':
+      return configReport($, rest[0] ?? '')
     case 'pr':
       return serial(() => prTask($, id, rest[1] === 'confirm'))
     case 'drop':
@@ -992,7 +1308,7 @@ async function runCommand($: EngineInterface, args: string) {
       return 'Idle workers stopped.'
     default:
       if (rest.length === 0) {
-        return 'Usage: /orch [task <repo> <description> [@role] [;; …] | prompt [<repo>] <request> [@role] [;; …] | retry <id> [note] | pr <id> [confirm] | drop <id> | stop-idle | <session> <message>]'
+        return 'Usage: /orch [task <repo> <description> [@role] [;; …] | prompt [<repo>] <request> [@role] [;; …] | answer <answers> | retry <id> [note] | followup <id> [note] | pr <id> [confirm] | drop <id> | config [<repo>] | stop-idle | <session> <message>]'
       }
       const known = [...(await read($, peers)).map(p => p.name), ...(await read($, workers)).map(w => w.name)]
       if (!known.includes(verb)) {
@@ -1007,7 +1323,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'orch',
-      description: 'Orchestra: `task <repo> <description> [@role]`, `prompt [<repo>] <request> [@role]` (brief written by the model first; without a repo it picks the repo; a workspace non-git target by its name), `retry <id> [note]`, `pr <id> [confirm]`, `drop <id>`, `stop-idle`, `<session> <message>`',
+      description: 'Orchestra: `task <repo> <description> [@role]`, `prompt [<repo>] <request> [@role]` (brief written by the model first; without a repo it picks the repo; a workspace non-git target by its name), `answer <answers>`, `retry <id> [note]`, `followup <id> [note]`, `pr <id> [confirm]`, `drop <id>`, `config [<repo>]`, `stop-idle`, `<session> <message>`',
     })
     $.clock.every(REFRESH_MS, () => void refresh($))
     void refresh($)
@@ -1019,7 +1335,7 @@ export const register: Register = on => {
     await loadWorkspaces($)
     await refresh($)
     const before = added
-    let text = await runCommand($, e.args)
+    let text = `${await runCommand($, e.args)}${configWarning()}`
     if (added > before && !(await read($, remoteSeen)) && !(await read($, reminded))) {
       await update($, reminded, () => true)
       await log($, { direction: 'notice', peer: 'remote', text: 'reminder given: /remote-control to get the alerts on the phone' })
@@ -1086,11 +1402,11 @@ export const register: Register = on => {
     const chosen = all.find(t => t.id === chosenId) ?? shown[0]
     const rows = Math.max(30, e.viewport?.rows ?? 40)
     const used = await read($, usage)
-    const totalCost = Object.values(used).reduce((sum, u) => sum + u.cost, 0)
+    const totalCost = Object.values(used).reduce((sum, u) => sum + u.cost, 0) + all.reduce((sum, t) => sum + (t.callCost ?? 0), 0)
     const taskCost = (task: Task) =>
       Object.entries(used)
         .filter(([name]) => name === task.worker || name.startsWith(`orch-review-${task.id}-`))
-        .reduce((sum, [, u]) => sum + u.cost, 0)
+        .reduce((sum, [, u]) => sum + u.cost, 0) + (task.callCost ?? 0)
     const retired = Object.entries(used).filter(
       ([name, u]) => u.role !== 'orchestrator' && !workerList.some(w => w.name === name),
     )
@@ -1128,6 +1444,11 @@ export const register: Register = on => {
         {needYou > 0 && (
           <Text color="red" bold>
             ⚠ {needYou} task{needYou === 1 ? ' needs' : 's need'} your decision
+          </Text>
+        )}
+        {workspaceErrors().length > 0 && (
+          <Text color="yellow">
+            ⚠ workspace config: {workspaceErrors().length} fault{workspaceErrors().length === 1 ? '' : 's'}, see /orch config
           </Text>
         )}
       </Box>

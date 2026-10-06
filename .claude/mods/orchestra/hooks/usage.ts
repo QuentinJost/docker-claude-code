@@ -10,6 +10,8 @@ export type TranscriptTotals = {
   cacheRead: number
   cacheWrite5m: number
   cacheWrite1h: number
+  /** The session's subagents, by model: their own transcripts, summed. */
+  subagents?: TranscriptTotals[]
 }
 
 /**
@@ -26,30 +28,62 @@ export const PRICES: Record<string, { input: number; output: number; write5m: nu
 
 /** The price row of a model id as transcripts write it (`claude-haiku-4-5-20251001` included). */
 export const priceOf = (model: string) =>
-  Object.entries(PRICES).find(([id]) => model === id || model.startsWith(`${id}-`) || model.startsWith(`${id}[`))?.[1]
+  Object.entries(PRICES).find(
+    // Transcripts also name a model by its family alone (`claude-opus-5` for Opus 5.5).
+    ([id]) => model === id || model.startsWith(`${id}-`) || model.startsWith(`${id}[`) || (/^claude-[a-z]+-\d+$/.test(model) && id.startsWith(`${model}-`)),
+  )?.[1]
 
-/** The estimated cost and context fill of one session from its transcript totals. */
-export const toUsage = (totals: TranscriptTotals, at: number): Omit<WorkerUsage, 'task' | 'role'> => {
+/** The model aliases sessions are launched with, as transcripts name them. */
+const ALIASES: Record<string, string> = { fable: 'claude-fable-5-1', opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-4-5' }
+
+const priced = (totals: Omit<TranscriptTotals, 'subagents'>): number => {
   const price = priceOf(totals.model)
-  const cost = price
+  return price
     ? (totals.input * price.input +
         totals.output * price.output +
         totals.cacheWrite5m * price.write5m +
         totals.cacheWrite1h * price.write1h +
         totals.cacheRead * price.read) /
-      1_000_000
+        1_000_000
     : 0
+}
+
+/** The estimated cost of one call to the orchestrator's model, from what the call reports. */
+export const callCost = (
+  model: string,
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number } | undefined,
+): number =>
+  usage === undefined
+    ? 0
+    : priced({
+    model: ALIASES[model] ?? model,
+    context: 0,
+    turns: 1,
+        input: usage.input_tokens ?? 0,
+        output: usage.output_tokens ?? 0,
+        cacheRead: usage.cache_read_input_tokens ?? 0,
+        cacheWrite5m: usage.cache_creation_input_tokens ?? 0,
+        cacheWrite1h: 0,
+      })
+
+const tokenSum = (t: Omit<TranscriptTotals, 'subagents'>): number => t.input + t.output + t.cacheRead + t.cacheWrite5m + t.cacheWrite1h
+
+/** The estimated cost and context fill of one session from its transcript totals, its subagents included. */
+export const toUsage = (totals: TranscriptTotals, at: number): Omit<WorkerUsage, 'task' | 'role'> => {
+  const price = priceOf(totals.model)
+  const subs = totals.subagents ?? []
+  const cost = priced(totals) + subs.reduce((sum, sub) => sum + priced(sub), 0)
 
   return {
     model: totals.model,
     context: totals.context,
     window: price?.window ?? 1_000_000,
-    tokens: totals.input + totals.output + totals.cacheRead + totals.cacheWrite5m + totals.cacheWrite1h,
-    output: totals.output,
+    tokens: tokenSum(totals) + subs.reduce((sum, sub) => sum + tokenSum(sub), 0),
+    output: totals.output + subs.reduce((sum, sub) => sum + sub.output, 0),
     turns: totals.turns,
     cost,
     // A session that has not answered yet costs nothing, whatever its model.
-    isPriced: price !== undefined || totals.turns === 0,
+    isPriced: (price !== undefined || totals.turns === 0) && subs.every(sub => priceOf(sub.model) !== undefined),
     at,
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "orchestra",
-  "version": "0.8.0",
-  "description": "Orchestrator (run it on Fable): queues tasks, sizes each session (model, effort), routes a request to its repo or to a non-git target, applies the rules of the workspace (orchestra.json) a repo sits in, runs one task per background session with a role agent, reviews with a reviewer agent, redispatches until approved",
+  "version": "0.10.0",
+  "description": "Orchestrator (run it on Fable): queues tasks, sizes each session (model, effort), routes a request to its repo or to a non-git target, applies the rules of the workspace (orchestra.json) a repo sits in, inits a non-git folder locally, runs the checks itself before a review, runs extra tasks of a repo in local clones, learns its sizing from past tasks, runs one task per background session with a role agent, reviews with a reviewer agent, redispatches until approved",
   "types": "./types/index.d.ts"
 }

@@ -1,10 +1,15 @@
-import type { Setting, Sizing, Task, Worker } from '../types'
+import type { HistoryEntry, Setting, Sizing, Task, Worker } from '../types'
 import {
   ROOT,
   allWorkspaces,
   fill,
   integrationFor,
   isKnownRole,
+  knownRoles,
+  roleCard,
+  characterFor,
+  reviewerCharacter,
+  roleSummaries,
   isLightRole,
   isTarget,
   repoRole,
@@ -12,6 +17,9 @@ import {
   targetNames,
   targetOf,
   ticketsFor,
+  newAppRules,
+  parallelFor,
+  trackers,
   workspaceDir,
   workspaceOf,
 } from './workspace'
@@ -37,6 +45,9 @@ export const repoPath = (repo: string): string => {
 /** Whether a task goes by a ticket: see ticketsFor. */
 export const hasTickets = (repo: string, text = ''): boolean => ticketsFor(repo, text) !== null
 
+/** Where a task works: a local clone when it runs beside another task of its repo, else the repo (or target) itself. */
+export const taskDir = (task: Pick<Task, 'repo' | 'dir'>): string => task.dir || repoPath(task.repo)
+
 const ROLE_TAG = /(^|\s)@([a-z-]+)\b/
 
 /** The role a task runs under: its `@role` when its workspace knows it, else the repo's. */
@@ -51,8 +62,8 @@ export const roleFor = (repo: string, text: string): { role: string; text: strin
 
 /** Splits `<repo> <description>` as typed in the pane or after `/orch task`. */
 export const parseTask = (input: string): { repo: string; text: string } | null => {
-  const [repo, ...words] = input.trim().split(/\s+/)
-  const text = words.join(' ')
+  // The text keeps its line breaks: a request may come with answers or a brief, line by line.
+  const [, repo, text = ''] = /^(\S+)\s+([\s\S]*)$/.exec(input.trim()) ?? []
 
   return repo && text ? { repo: repo.replace(new RegExp(`^${ROOT}/`), '').replace(/\/$/, ''), text } : null
 }
@@ -125,7 +136,7 @@ export const parseOverrides = (text: string): Overrides => {
     }
   }
 
-  return { text: text.replace(OVERRIDE, ' ').replace(/\s+/g, ' ').trim(), work, after: [...new Set(after)], from }
+  return { text: text.replace(OVERRIDE, ' ').replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim(), work, after: [...new Set(after)], from }
 }
 
 export const SIZING_SYSTEM = [
@@ -135,11 +146,29 @@ export const SIZING_SYSTEM = [
   `Development runs on ${WORK_FLOOR} or fable, never below ${WORK_FLOOR}: pick between those two and size the effort; the reviewer runs on ${SESSION_FLOOR}, opus or fable.`,
   'Effort: low, medium, high, xhigh, max. Raise it for subtle logic, security, data migrations, concurrency, money; lower it for mechanical work.',
   'The reviewer must be able to catch what the developer can miss: never weaker than the development on a risky task.',
+  'Past tasks, when listed, are evidence: a setting that got similar tasks approved at round 1 is enough, take the cheaper one; a setting that needed several rounds, check fixes or escalated was too weak, go stronger.',
   'Reply with JSON only: {"work":{"model":"…","effort":"…"},"review":{"model":"…","effort":"…"},"why":"one short sentence"}',
 ].join('\n')
 
-export const sizingPrompt = (repo: string, role: string, text: string): string =>
-  `Repo: ${repo}\nRole: ${role}\nTask: ${text}`
+/** How many past tasks the sizing sees. */
+export const HISTORY_SHOWN = 15
+
+/** One past task as the sizing reads it. */
+const historyLine = (h: HistoryEntry): string =>
+  `- ${h.repo} · ${h.role} · dev ${h.work.model}·${h.work.effort} · review ${h.review.model}·${h.review.effort} → ${h.outcome} after ${h.rounds} round(s)${h.checkFixes ? `, ${h.checkFixes} check fix(es)` : ''}, ≈$${h.cost.toFixed(2)} · ${h.title}`
+
+/** The past tasks closest to this one: same role or repo first, most recent first. */
+export const relevantHistory = (history: readonly HistoryEntry[], repo: string, role: string): HistoryEntry[] => {
+  const recent = [...history].reverse()
+  const close = recent.filter(h => h.role === role || h.repo === repo)
+  return [...close, ...recent.filter(h => !close.includes(h))].slice(0, HISTORY_SHOWN)
+}
+
+export const sizingPrompt = (repo: string, role: string, text: string, history: readonly HistoryEntry[] = []): string =>
+  [
+    `Repo: ${repo}\nRole: ${role}\nTask: ${text}`,
+    ...(history.length ? ['', 'Past tasks (setting → outcome, cost):', ...relevantHistory(history, repo, role).map(historyLine)] : []),
+  ].join('\n')
 
 /** Reads the sizing JSON the orchestrator's model replied, or null when it is not one. */
 export const parseSizing = (reply: string): Sizing | null => {
@@ -165,13 +194,14 @@ export const UPGRADE_SYSTEM = [
   '1. Objective (what and why, one or two lines) 2. Context (repo, area, current state, as far as the request says) 3. Task (precise, numbered steps when several) 4. Constraints (conventions, scope limits, what not to touch) 5. Done when (observable checks: tests, behaviour).',
   'Keep every fact, identifier and ticket key of the request verbatim; never invent requirements, file names or data the request does not give. Where the request leaves a routine choice open, say which default the developer should take.',
   'A request whose intent cannot be told, or that contradicts itself, is not forwarded: ask instead, with the fewest questions that would settle it.',
-  'Reply with JSON only, either {"status":"ready","title":"one line, 100 characters at most, the ticket key first when there is one","brief":"the brief, markdown, newlines as \\n"} or {"status":"unclear","questions":["…"]}.',
+  `A request that spans distinct domains of one repo (an API and the UI that uses it, a schema migration and the code on it, the code and its end-to-end tests) is split into one task per domain, each for the role of that domain among the roles listed, so that each is done by a specialist; at most ${4} tasks. Tasks run one after the other in a repo: give a task "after", the 0-based positions of the earlier tasks of your list it builds on (the UI waits for the API it calls). Do not split a request that one developer does best in one go (a small change, a single domain).`,
+  'Reply with JSON only, one of: {"status":"ready","title":"one line, 100 characters at most, the ticket key first when there is one","role":"a listed role, or omit it","brief":"the brief, markdown, newlines as \\n"} for one task; {"status":"ready","tasks":[{"role":"a listed role","after":[0],"title":"…","brief":"…"}]} for a split; or {"status":"unclear","questions":["…"]}.',
 ].join('\n')
 
 /** How a repo reads in prompts: its ticket tracker, or that it has none. */
 const ticketNote = (repo: string, text = ''): string => {
   const tickets = ticketsFor(repo, text)
-  return tickets ? ` (tickets: ${tickets.name})` : ' (no ticket tracker: there is no key, never ask for one)'
+  return tickets ? ` (ticket task: ${tickets.name})` : ' (the request names no ticket key: no ticket rules, never look for or ask for a key)'
 }
 
 export const upgradePrompt = (repo: string, role: string, text: string): string =>
@@ -180,6 +210,7 @@ export const upgradePrompt = (repo: string, role: string, text: string): string 
       ? `Target: ${targetOf(repo)?.target.about ?? repo}, from ${repoPath(repo)}, which is not a git repo: operations work, no code change. Done-when checks are observable states of the target.`
       : `Repo: ${ROOT}/${repo}${ticketNote(repo, text)}`,
     `Developer role: ${role} (its role card, if any, is loaded in its session)`,
+    ...(Object.keys(knownRoles(repo)).length ? [`Roles for a split: ${roleSummaries(repo).join(', ')}`] : []),
     `Request:\n${text}`,
   ].join('\n')
 
@@ -195,25 +226,26 @@ export const ROUTE_SYSTEM = [
   `The request names no repo: you also pick where the work happens, among the git repositories listed (paths under ${ROOT}) and the non-git targets listed. Read the workspace overviews to know what each one is.`,
   'Work on a non-git target itself, with no code change in any repo, goes to that target, by its name as listed.',
   'Pick the repo whose code the change lives in. Prefer a main checkout over a ticket worktree (a folder named after a ticket key) unless the request names that ticket; never pick a throwaway sandbox unless the request names it; never pick a repo marked as migrated or deprecated.',
-  `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED}); say in each brief what the other side does. Tasks run in parallel unless one needs another's result: then give it "after", the 0-based positions of the earlier tasks of your list it waits for (the frontend that consumes a new API field waits for the backend task).`,
-  `A request on a repo with a ticket tracker and no key: do not invent one; the developer searches the tracker. A request you cannot place is not forwarded: ask instead.`,
-  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","after":[0],"title":"one line, 100 characters at most, the ticket key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
+  `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED} tasks in all); say in each brief what the other side does. Within one repo, split by domain as above, several tasks on the same repo. Tasks run in parallel unless one needs another's result: then give it "after", the 0-based positions of the earlier tasks of your list it waits for (the frontend that consumes a new API field waits for the backend task).`,
+  `Ticket rules apply only to a request that names a ticket key: never invent, search or ask for a key. A request you cannot place is not forwarded: ask instead.`,
+  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","role":"a listed role, or omit it","after":[0],"title":"one line, 100 characters at most, the ticket key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
 ].join('\n')
 
 export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: string | null, text: string): string =>
   [
     `Targets: the git repositories under ${ROOT}${targetNames().length ? ', and the non-git targets' : ''}:`,
     ...allWorkspaces().flatMap(ws => Object.entries(ws.targets ?? {}).map(([name, t]) => `- ${name} — ${t.about}, no git`)),
-    // Per repo, not per request: a key in the request says nothing of the other repos.
-    ...repos.map(r => `- ${r.repo}${r.about ? ` — ${r.about}` : ''}${ticketsFor(r.repo) ? ` (tickets: ${ticketsFor(r.repo)?.name})` : ' (no ticket tracker)'}`),
+    ...repos.map(r => `- ${r.repo}${r.about ? ` — ${r.about}` : ''}`),
+    ...(trackers().length ? ['', `Ticket trackers: ${trackers().map(t => t.name).join(', ')}; a task is a ticket task only when the request names a key.`] : []),
     ...allWorkspaces().flatMap(ws => (ws.route ?? []).map(line => fill(line, { workspace: workspaceDir(ws) }))).map((line, i) => (i === 0 ? `\nRouting rules of the workspaces:\n- ${line}` : `- ${line}`)),
     ...(overview ? ['', 'Workspace overview:', overview] : []),
     '',
+    ...(Object.keys(knownRoles(null)).length ? ['', `Roles: ${roleSummaries(null).join(', ')}`] : []),
     ...(role ? [`Developer role, named by the person: ${role}`] : []),
     `Request:\n${text}`,
   ].join('\n')
 
-export type RoutedTask = { repo: string; title: string; brief: string; after: number[] }
+export type RoutedTask = { repo: string; title: string; brief: string; after: number[]; role?: string }
 
 export type Routed = { tasks: RoutedTask[] } | { questions: string[] }
 
@@ -228,13 +260,19 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
     if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
       const known = new Set([...targetNames(), ...repos.map(r => r.repo)])
       const tasks = parsed.tasks
-        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown; after?: unknown })
+        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown; after?: unknown; role?: unknown })
         .filter(t => typeof t.repo === 'string' && known.has(t.repo) && typeof t.brief === 'string' && t.brief.trim() !== '')
         .map((t, index) => {
           const brief = String(t.brief).trim()
           // Only earlier tasks of the same list: no cycle, and their ids exist by then.
           const after = Array.isArray(t.after) ? t.after.filter((n): n is number => Number.isInteger(n) && n >= 0 && n < index) : []
-          return { repo: String(t.repo), title: firstLine(typeof t.title === 'string' ? t.title.trim() : '') || firstLine(brief), brief, after }
+          return {
+            repo: String(t.repo),
+            title: firstLine(typeof t.title === 'string' ? t.title.trim() : '') || firstLine(brief),
+            brief,
+            after,
+            ...(typeof t.role === 'string' && t.role ? { role: t.role } : {}),
+          }
         })
         .slice(0, MAX_ROUTED)
       return tasks.length > 0 && tasks.length === Math.min(parsed.tasks.length, MAX_ROUTED) ? { tasks } : null
@@ -249,18 +287,29 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
   }
 }
 
-export type Upgrade = { title: string; brief: string } | { questions: string[] }
+export type Upgrade = { title: string; brief: string; role?: string } | { tasks: RoutedTask[] } | { questions: string[] }
 
 /** Reads the upgrade JSON the orchestrator's model replied, or null when it is not one. */
-export const parseUpgrade = (reply: string): Upgrade | null => {
+/** Reads the upgrade JSON: one brief, a split of the request by domain into tasks on `repo`, or questions. */
+export const parseUpgrade = (reply: string, repo = ''): Upgrade | null => {
   const json = /\{[\s\S]*\}/.exec(reply)?.[0]
   if (!json) {
     return null
   }
   try {
-    const parsed = JSON.parse(json) as { status?: string; title?: string; brief?: string; questions?: unknown }
+    const parsed = JSON.parse(json) as { status?: string; title?: string; brief?: string; role?: unknown; tasks?: unknown; questions?: unknown }
+    if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
+      // The same shape as a routing, every task on the repo the person named.
+      const tasks = (parsed.tasks as Record<string, unknown>[]).map(t => ({ ...t, repo }))
+      const routed = parseRouting(JSON.stringify({ status: 'ready', tasks }), [{ repo, about: '' }])
+      return routed && 'tasks' in routed ? routed : null
+    }
     if (parsed.status === 'ready' && typeof parsed.title === 'string' && typeof parsed.brief === 'string' && parsed.brief.trim()) {
-      return { title: firstLine(parsed.title.trim()) || firstLine(parsed.brief.trim()), brief: parsed.brief.trim() }
+      return {
+        title: firstLine(parsed.title.trim()) || firstLine(parsed.brief.trim()),
+        brief: parsed.brief.trim(),
+        ...(typeof parsed.role === 'string' && parsed.role ? { role: parsed.role } : {}),
+      }
     }
     if (parsed.status === 'unclear' && Array.isArray(parsed.questions)) {
       const questions = parsed.questions.filter((q): q is string => typeof q === 'string' && q.trim() !== '')
@@ -276,6 +325,22 @@ export const agentName = (role: string): string => `orch-${role}`
 
 export const REVIEWER = 'orch-reviewer'
 
+/**
+ * The personality lines of a session: the theme's rules and the character's card, kept to the
+ * prose, so that the lines the orchestrator reads (STATUS:, VERDICT:…) stay as the brief asks.
+ */
+const personalityLines = (played: { theme: string; character: { name: string; card: string } } | null): string[] =>
+  played
+    ? [
+        `You play ${played.character.name}: the theme and the character card follow. They set your tone only, never your work, and the files they name are not to be looked for. The personality goes in your prose: every line the brief's report format asks for (STATUS:, SUMMARY:, BRANCH:, CHANGES:, TESTS:, NEEDS:, VERDICT:, FINDINGS:) keeps its exact form, with your signature quote before them.`,
+        '----- theme -----',
+        played.theme,
+        '----- character card -----',
+        played.character.card,
+        '----- end of personality -----',
+      ]
+    : []
+
 /** The workspace a task's repo or target belongs to. */
 const wsOf = (repo: string) => workspaceOf(repo) ?? targetOf(repo)?.ws ?? null
 
@@ -283,9 +348,19 @@ const wsOf = (repo: string) => workspaceOf(repo) ?? targetOf(repo)?.ws ?? null
 export const workerAgent = (role: string, repo = ''): string => {
   const ws = wsOf(repo)
   const values = { role, folder: roleFolder(role, repo || null), workspace: ws ? workspaceDir(ws) : ROOT }
+  const card = repo ? roleCard(role, repo) : null
   const prompt = [
     `You are the ${role} worker of an orchestrator session. You do the task yourself: in this session you are not the Prompt Manager and you do not dispatch.`,
+    ...(card
+      ? [
+          `Your role card follows: it is who you are and the standards you hold. It is written for any project: where it names project files (project-context.md, docs/, a README), read the target repo's own when they exist, and go on without them otherwise.`,
+          '----- role card -----',
+          card.prompt,
+          '----- end of role card -----',
+        ]
+      : []),
     ...(ws?.roles?.worker ?? []).map(line => fill(line, values)),
+    ...personalityLines(repo ? characterFor(role, repo) : null),
     'Tasks arrive as cross-session messages from the orchestrator. One task at a time; stay inside the repo the brief names.',
     'Always finish by replying with SendMessage to the orchestrator, in the exact report format the brief asks for.',
   ].join('\n')
@@ -300,6 +375,7 @@ export const reviewerAgent = (repo = ''): string => {
     'You are the code reviewer of an orchestrator session. You review; you never edit, commit, push, or comment on GitHub.',
     ...(ws?.roles?.reviewer ?? []).map(line => fill(line, { workspace: workspaceDir(ws as NonNullable<typeof ws>) })),
     'Review against the task\'s acceptance criteria and the repo\'s own conventions. Verify every finding against the code before reporting it. Approve only when no 🔴 blocking and no 🟠 major finding remains.',
+    ...personalityLines(repo ? reviewerCharacter(repo) : null),
     'Always finish by replying with SendMessage to the orchestrator, in the exact verdict format the brief asks for.',
   ].join('\n')
 
@@ -316,7 +392,7 @@ const branchRule = (task: Task): string => {
 
   return tickets
     ? tickets.worker.map(line => `- ${fill(line, { from, start })}`).join('\n')
-    : `- This repo has no ticket tracker: never look for or ask for a ticket key. Branch named <type>/<short-slug> like the repo's existing branches (feat/…, fix/…, perf/…, chore/…), created from ${from} (git switch -c <branch> ${start}), never from another task's branch.`
+    : `- The request names no ticket key: no ticket rules, never look for or ask for a key. Branch named <type>/<short-slug> like the repo's existing branches (feat/…, fix/…, perf/…, chore/…), created from ${from} (git switch -c <branch> ${start}), never from another task's branch.`
 }
 
 /** The rules of every non-git target, before its workspace's own. */
@@ -339,7 +415,8 @@ export const workerBrief = (self: string, task: Task): string =>
   isTarget(task.repo) ? targetBrief(self, task) : [
     `[ORCH ${self} · task #${task.id} · round 1] ${firstLine(task.text)}`,
     '',
-    `Repo: ${ROOT}/${task.repo} (work only there)`,
+    `Repo: ${taskDir(task)} (work only there)`,
+    ...(task.dir ? [`This is a local clone of ${ROOT}/${task.repo}, for this task only: another task works in the main checkout. Install dependencies here if the tests need them; never touch the main checkout.`] : []),
     `Task: ${task.text}`,
     ...(task.prior ? ['', task.prior] : []),
     '',
@@ -350,6 +427,7 @@ export const workerBrief = (self: string, task: Task): string =>
       : '- Commit locally with the project\'s git identity and subject format, without any ticket key; never push.',
     '- Run the relevant tests before reporting.',
     ...(integrationFor(task.repo) ? [`- Run the integration suite too, from the repo: ${integrationFor(task.repo)}. A task is not done while it fails; report its result in TESTS.`] : []),
+    ...(task.isNewApp && newAppRules(task.repo).length ? ['- This is a new app. Every new app must meet these rules, as part of this task:', ...newAppRules(task.repo).map(line => `  - ${line}`)] : []),
     '',
     `When finished, reply via SendMessage to "${self}" with:`,
     'STATUS: done | blocked | failed',
@@ -376,7 +454,7 @@ const targetBrief = (self: string, task: Task): string =>
   ].join('\n')
 
 /** Where a task's work is, as the follow-up briefs say it. */
-const where = (task: Task): string => (isTarget(task.repo) ? `Target: ${task.repo}, from ${repoPath(task.repo)}` : `Repo: ${ROOT}/${task.repo}`)
+const where = (task: Task): string => (isTarget(task.repo) ? `Target: ${task.repo}, from ${repoPath(task.repo)}` : `Repo: ${taskDir(task)}`)
 
 /** The rules a follow-up brief repeats. */
 const sameRules = (task: Task, tests: boolean): string =>
@@ -396,6 +474,35 @@ export const reworkBrief = (self: string, task: Task, findings: string): string 
     '',
     `Fix every 🔴 and 🟠 finding; answer the others in SUMMARY. ${sameRules(task, false)}`,
     `Reply via SendMessage to "${self}" with STATUS / SUMMARY / CHANGES / TESTS / NEEDS, as before.`,
+  ].join('\n')
+
+/** The orchestrator's own checks failed on the reported code: back to the worker, no review round spent. */
+export const checksBrief = (self: string, task: Task, failed: string, output: string): string =>
+  [
+    `[ORCH ${self} · task #${task.id} · round ${task.round}] Checks failed before review: fix and report again`,
+    '',
+    where(task),
+    `Task: ${task.text}`,
+    '',
+    `The orchestrator ran \`${failed}\` in ${taskDir(task)} on your branch, and it failed. The end of its output:`,
+    '```',
+    output,
+    '```',
+    '',
+    `Make it pass, without weakening or skipping the check. ${sameRules(task, true)}`,
+    `Reply via SendMessage to "${self}" with STATUS / SUMMARY / CHANGES / TESTS / NEEDS, as before.`,
+  ].join('\n')
+
+/** The text of a follow-up task: an approved task's remaining review remarks, on top of its branch. */
+export const followupText = (task: Task, note: string): string =>
+  [
+    `Follow-up of #${task.id}: ${firstLine(task.text)}`,
+    '',
+    `Address the remarks the reviewer left on #${task.id}, which was approved with them${task.branch ? `; its work is on branch ${task.branch}, build on it` : ''}:`,
+    task.reviews.at(-1)?.findings || '(none recorded)',
+    ...(note ? ['', `The person adds: ${note}`] : []),
+    '',
+    'Done when: each remark is fixed, or answered in SUMMARY when it should not be.',
   ].join('\n')
 
 /** The person's answer to a blocked worker: the task again, with the answer, same rules. */
@@ -442,7 +549,7 @@ export const takeoverBrief = (self: string, task: Task, previous: string, latest
     `[ORCH ${self} · task #${task.id} · round ${task.round}] You take over this task: ${previous}, the session that worked on it, is gone.`,
     isTarget(task.repo)
       ? 'Part of the work may already be done on the target: check its current state first, and carry on from there rather than starting over.'
-      : `Its work may already be in ${ROOT}/${task.repo}: check the branches and the task branch's commits first, and carry on from there rather than starting over.`,
+      : `Its work may already be in ${taskDir(task)}: check the branches and the task branch's commits first, and carry on from there rather than starting over.`,
     '',
     'The task as first briefed:',
     '',
@@ -457,12 +564,16 @@ export const reviewBrief = (self: string, task: Task): string =>
   isTarget(task.repo) ? targetReviewBrief(self, task) : [
     `[ORCH ${self} · review task #${task.id} · round ${task.round}] ${firstLine(task.text)}`,
     '',
-    `Repo: ${ROOT}/${task.repo}`,
+    `Repo: ${taskDir(task)}`,
     `Task: ${task.text}`,
-    `Base: ${task.base || 'unknown'} (${task.branchFrom || 'current branch'}). Review everything since it: git -C ${ROOT}/${task.repo} log ${task.base}..HEAD, git -C ${ROOT}/${task.repo} diff ${task.base}, and any uncommitted change.`,
+    `Base: ${task.base || 'unknown'} (${task.branchFrom || 'current branch'}). Review everything since it: git -C ${taskDir(task)} log ${task.base}..HEAD, git -C ${taskDir(task)} diff ${task.base}, and any uncommitted change.`,
+    ...(task.checks ? [`The orchestrator already ran the repo's checks on this code, green: ${task.checks}. Do not rerun them; spend the review on the code.`] : []),
     ...(ticketsFor(task.repo, task.text)
       ? ticketsFor(task.repo, task.text)?.reviewer ?? []
-      : ['This repo has no ticket tracker: no ticket key in the branch or commits, and the acceptance criteria are the brief\'s "Done when" list. Never raise a missing key as a finding.']),
+      : ['The request names no ticket key: no ticket key in the branch or commits, and the acceptance criteria are the brief\'s "Done when" list. Never raise a missing key as a finding.']),
+    ...(task.isNewApp && newAppRules(task.repo).length
+      ? ['This is a new app: it must meet these rules, and one not met is a 🔴 finding:', ...newAppRules(task.repo).map(line => `- ${line}`)]
+      : []),
     ...(integrationFor(task.repo)
       ? [`This repo's integration suite (${integrationFor(task.repo)}) must have run green on the final code: a report whose TESTS does not show it is a 🔴 finding. Rerun it yourself when the report leaves a doubt.`]
       : []),
@@ -534,7 +645,7 @@ export const parseNeeds = (report: string): string | null => {
   return /^(none|n\/a|nothing|-|no)\b/i.test(needs) || needs === '' ? null : needs
 }
 
-const ACTIVE: Task['state'][] = ['working', 'reviewing', 'blocked', 'escalated']
+const ACTIVE: Task['state'][] = ['working', 'checking', 'reviewing', 'blocked', 'escalated']
 
 /**
  * The next dispatches: queued tasks in order, one active task per repo, one task per
@@ -606,31 +717,49 @@ export const parsePr = (reply: string): { title: string; body: string } | null =
   }
 }
 
-export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Worker | null }[] => {
-  const busyRepos = new Set(tasks.filter(t => ACTIVE.includes(t.state)).map(t => t.repo))
+/**
+ * The next dispatches: queued tasks in order, one task per worker. A repo runs one task in its
+ * main checkout and, when its workspace allows more at once, the others in local clones (`inClone`).
+ * A task gets an idle worker of its repo, role, model and effort (main checkout only), or `null`: launch one.
+ */
+export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Worker | null; inClone: boolean }[] => {
+  const active = tasks.filter(t => ACTIVE.includes(t.state))
+  const running = new Map<string, number>()
+  const mainBusy = new Set<string>()
+  for (const t of active) {
+    running.set(t.repo, (running.get(t.repo) ?? 0) + 1)
+    if (!t.dir) {
+      mainBusy.add(t.repo)
+    }
+  }
   const taken = new Set<string>()
-  const moves: { task: Task; worker: Worker | null }[] = []
+  const moves: { task: Task; worker: Worker | null; inClone: boolean }[] = []
 
   for (const task of tasks.filter(t => t.state === 'queued')) {
     // A task waiting for another does not hold its repo: the next one of that repo may go first.
-    if (busyRepos.has(task.repo) || !isReady(task, tasks)) {
+    if ((running.get(task.repo) ?? 0) >= parallelFor(task.repo) || !isReady(task, tasks)) {
       continue
     }
-    const worker =
-      workers.find(
-        w =>
-          w.task === null &&
-          !taken.has(w.name) &&
-          w.repo === task.repo &&
-          w.role === task.role &&
-          w.model === task.sizing.work.model &&
-          w.effort === task.sizing.work.effort,
-      ) ?? null
-    busyRepos.add(task.repo)
+    const inClone = mainBusy.has(task.repo)
+    const worker = inClone
+      ? null
+      : workers.find(
+          w =>
+            w.task === null &&
+            !taken.has(w.name) &&
+            w.repo === task.repo &&
+            w.role === task.role &&
+            w.model === task.sizing.work.model &&
+            w.effort === task.sizing.work.effort,
+        ) ?? null
+    running.set(task.repo, (running.get(task.repo) ?? 0) + 1)
+    if (!inClone) {
+      mainBusy.add(task.repo)
+    }
     if (worker) {
       taken.add(worker.name)
     }
-    moves.push({ task, worker })
+    moves.push({ task, worker, inClone })
   }
 
   return moves

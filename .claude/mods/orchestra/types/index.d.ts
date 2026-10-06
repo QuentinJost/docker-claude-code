@@ -1,6 +1,6 @@
 export type Peer = { name: string; ref: string; kind: string; status: string; started: string }
 
-export type TaskState = 'queued' | 'working' | 'reviewing' | 'approved' | 'blocked' | 'escalated' | 'dropped'
+export type TaskState = 'queued' | 'working' | 'checking' | 'reviewing' | 'approved' | 'blocked' | 'escalated' | 'dropped'
 
 /** What a session is launched with. */
 export type Setting = { model: string; effort: string }
@@ -40,6 +40,31 @@ export type Task = {
   prDraft?: { title: string; body: string }
   /** The pull request's URL once opened. */
   pr?: string
+  /** Where the task works when not in the repo's main checkout: a local clone, for parallel tasks. */
+  dir?: string
+  /** The orchestrator's own checks that passed on the reported code, for the reviewer. */
+  checks?: string
+  /** How many times the orchestrator's own checks sent the task back before a review. */
+  checkFixes?: number
+  /** The orchestrator made the task's folder a repo (git init or a first commit): a new app, with its rules. */
+  isNewApp?: boolean
+  /** What the orchestrator's own model calls for this task cost (sizing, brief, routing), in $. */
+  callCost?: number
+}
+
+/** One finished task, kept to size the next ones better. */
+export type HistoryEntry = {
+  at: number
+  repo: string
+  role: string
+  title: string
+  work: Setting
+  review: Setting
+  /** approved, escalated (rejected at every round) or dropped. */
+  outcome: 'approved' | 'escalated' | 'dropped'
+  rounds: number
+  checkFixes: number
+  cost: number
 }
 
 /** A background session this orchestrator launched; `task` is the one it holds, if any. */
@@ -92,6 +117,8 @@ declare module 'claude-code' {
       remoteSeen: boolean
       /** The Remote Control reminder was given in this session. */
       reminded: boolean
+      /** A request the model answered with questions, kept for /orch answer. */
+      pending: { input: string; questions: string[] } | null
     }
   }
 }

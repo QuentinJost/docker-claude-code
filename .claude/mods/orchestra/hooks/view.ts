@@ -5,6 +5,7 @@ import { MAX_ROUNDS } from './pipeline'
 export const BADGE: Record<TaskState, { icon: string; label: string; color: string }> = {
   queued: { icon: '◌', label: 'queued', color: 'gray' },
   working: { icon: '●', label: 'working', color: 'yellow' },
+  checking: { icon: '◑', label: 'checks', color: 'blue' },
   reviewing: { icon: '◐', label: 'review', color: 'cyan' },
   approved: { icon: '✔', label: 'approved', color: 'green' },
   blocked: { icon: '⏸', label: 'blocked', color: 'magenta' },
@@ -38,7 +39,7 @@ export const lastFindings = (task: Task): string[] =>
     .map(line => line.trim())
     .filter(Boolean)
 
-export const STATES: TaskState[] = ['working', 'reviewing', 'queued', 'blocked', 'escalated', 'approved']
+export const STATES: TaskState[] = ['working', 'checking', 'reviewing', 'queued', 'blocked', 'escalated', 'approved']
 
 /** Tasks in the order the person reads them: what needs them first, then what moves, then what is done. */
 export const ordered = (tasks: Task[]): Task[] => {
@@ -46,6 +47,7 @@ export const ordered = (tasks: Task[]): Task[] => {
     escalated: 0,
     blocked: 1,
     reviewing: 2,
+    checking: 2,
     working: 3,
     queued: 4,
     approved: 5,

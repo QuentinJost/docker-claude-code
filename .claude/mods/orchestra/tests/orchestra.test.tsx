@@ -4,9 +4,9 @@ import type { On } from 'claude-code'
 
 import { deliveryFailure, isAutoModeHold, parseBackgrounded, parseListing } from '../hooks/parse'
 import { dollars, fillBar, toUsage } from '../hooks/usage'
-import { SIZING_SYSTEM, atLeast, hasTickets, reviewerAgent, workerAgent, parseRouting, parseNeeds, parseOverrides, parseSizing, parseStatus, parseUpgrade, parseVerdict, plan, reviewBrief, roleFor, upgradePrompt, workerBrief } from '../hooks/pipeline'
-import type { Task, Worker } from '../types'
-import { parseWorkspaces, setWorkspaces } from '../hooks/workspace'
+import { SIZING_SYSTEM, UPGRADE_SYSTEM, atLeast, hasTickets, reviewerAgent, workerAgent, parseRouting, parseNeeds, parseOverrides, parseSizing, parseStatus, parseUpgrade, parseVerdict, plan, reviewBrief, roleFor, upgradePrompt, workerBrief } from '../hooks/pipeline'
+import type { HistoryEntry, Task, Worker } from '../types'
+import { checksFor, describe, parallelFor, parseWorkspaces, setWorkspaces } from '../hooks/workspace'
 import type { Workspace } from '../hooks/workspace'
 
 const LISTING = [
@@ -42,8 +42,7 @@ const WORKSPACES: Workspace[] = [
     tickets: {
       name: 'tracker ACME',
       key: 'ACME-\\d+',
-      except: ['datalodestar', 'mtg', 'orch-sandbox*'],
-      worker: ['Branch named after the ticket key of the task (ACME-<n>), created from {from} (git switch -c <key> {start}), never from another task\'s branch. No key in the task: search the tracker yourself first. Exactly one ticket fits: use its key. None or several: report STATUS: blocked with the candidates in NEEDS.'],
+      worker: ['Branch named after the ticket key of the task (ACME-<n>), created from {from} (git switch -c <key> {start}), never from another task\'s branch.'],
     },
     integration: { datalodestar: 'make integration' },
     overview: ['agents/project-overview.md'],
@@ -58,6 +57,13 @@ const WORKSPACES: Workspace[] = [
   },
 ]
 setWorkspaces(WORKSPACES)
+
+/** The workspaces hooks/repos.py answers in the tests; `serve` changes them for one test. */
+let served: Workspace[] = WORKSPACES
+const serve = (list: Workspace[]) => {
+  served = list
+  setWorkspaces(list)
+}
 
 /** The state badge of task #id as drawn in the pane, or undefined when the task is not listed. */
 const stateOf = async (ui: { find: (q: { key: string }) => Promise<{ text?: string } | undefined> }, id: number) =>
@@ -105,38 +111,24 @@ test('picks the role from the repo, or from @role', async () => {
   expect(roleFor('utils/acme', 'add a tag').role).toBe('developer')
 })
 
-test('a repo without tickets never asks for a key', async () => {
-  const task = { id: 7, repo: 'acme/datalodestar', text: 'bulk delete', branchFrom: 'main', round: 1, report: '', reviews: [] } as unknown as Task
-  expect(hasTickets('acme/datalodestar')).toBe(false)
-  expect(workerBrief('orch', task)).not.toContain('ACME')
-  expect(workerBrief('orch', task)).toContain('git switch -c <branch> main')
-  expect(reviewBrief('orch', task)).toContain('no ticket tracker')
-  expect(upgradePrompt('acme/datalodestar', 'lead-backend', 'x')).toContain('no ticket tracker')
-
-  const acme = { ...task, repo: 'acme/core/acme' } as Task
-  expect(hasTickets('acme/core/acme')).toBe(true)
-  expect(workerBrief('orch', acme)).toContain('ACME-<n>')
-  expect(reviewBrief('orch', acme)).not.toContain('no ticket tracker')
-  expect(upgradePrompt('acme/core/acme', 'lead-backend', 'x')).not.toContain('no ticket tracker')
-})
-
-test('only a workspace with tickets needs a key, unless the request names a key', () => {
-  expect(hasTickets('acme/core/acme-backend')).toBe(true)
-  // Personal repos of the workspace and sandboxes, by folder name wherever they sit.
-  expect(hasTickets('acme/datalodestar')).toBe(false)
-  expect(hasTickets('acme/orch-sandbox-2')).toBe(false)
-  // Outside the workspace: no tickets by default.
-  expect(hasTickets('mtg')).toBe(false)
-  expect(hasTickets('claude-code')).toBe(false)
-  const mtg = { id: 8, repo: 'mtg', text: 'add a deck page', branchFrom: 'main', round: 1, report: '', reviews: [] } as unknown as Task
-  expect(workerBrief('orch', mtg)).not.toContain('ACME-<n>')
-  // A key named in the request makes it a ticket task anywhere.
+test('ticket rules apply only when the request names a key', async () => {
+  const task = (repo: string, text: string) => ({ id: 7, repo, text, branchFrom: 'main', round: 1, report: '', reviews: [] }) as unknown as Task
+  // No key named: no ticket rules, even in a workspace with a tracker.
+  expect(hasTickets('acme/core/acme-backend')).toBe(false)
+  expect(hasTickets('acme/core/acme-backend', 'fix the export')).toBe(false)
+  expect(workerBrief('orch', task('acme/core/acme-backend', 'fix the export'))).not.toContain('ACME-<n>')
+  expect(workerBrief('orch', task('acme/core/acme-backend', 'fix the export'))).toContain('git switch -c <branch> main')
+  expect(workerBrief('orch', task('acme/core/acme-backend', 'fix the export'))).toContain('never look for or ask for a key')
+  expect(reviewBrief('orch', task('acme/core/acme-backend', 'fix'))).toContain('names no ticket key')
+  expect(upgradePrompt('acme/core/acme-backend', 'lead-backend', 'x')).toContain('names no ticket key')
+  // A key named: the tracker's rules, in the workspace or anywhere else.
+  expect(hasTickets('acme/core/acme-backend', 'ACME-7400 fix')).toBe(true)
   expect(hasTickets('mtg', 'ACME-7400 add a deck page')).toBe(true)
-  expect(hasTickets('acme/datalodestar', 'fix ACME-12')).toBe(true)
-  expect(workerBrief('orch', { ...mtg, text: 'ACME-7400 add a deck page' })).toContain('ACME-<n>')
-  expect(upgradePrompt('mtg', 'lead-backend', 'ACME-7400 x')).not.toContain('no ticket tracker')
+  expect(workerBrief('orch', task('mtg', 'ACME-7400 add a deck page'))).toContain('ACME-<n>')
+  expect(reviewBrief('orch', task('mtg', 'ACME-7400 x'))).not.toContain('names no ticket key')
+  expect(upgradePrompt('mtg', 'lead-backend', 'ACME-7400 x')).toContain('ticket task: tracker ACME')
   // Look-alikes are not keys.
-  expect(hasTickets('mtg', 'UTF-8 names, ORCH-3, XACME-1')).toBe(false)
+  expect(hasTickets('acme/core/acme-backend', 'UTF-8 names, ORCH-3, XACME-1')).toBe(false)
 })
 
 test('without a workspace the mod knows no project: generic role, no tickets, no target', () => {
@@ -145,7 +137,7 @@ test('without a workspace the mod knows no project: generic role, no tickets, no
     const task = { id: 9, repo: 'acme/core/acme-backend', text: 'ACME-1 fix', branchFrom: 'main', round: 1, report: '', reviews: [] } as unknown as Task
     expect(roleFor('acme/core/acme-backend', 'fix @dba').role).toBe('developer')
     expect(hasTickets('acme/core/acme-backend', 'ACME-1 fix')).toBe(false)
-    expect(workerBrief('orch', task)).toContain('no ticket tracker')
+    expect(workerBrief('orch', task)).toContain('names no ticket key')
     expect(workerBrief('orch', { ...task, repo: 'stack' })).toContain('Repo: /app/stack')
     expect(workerAgent('developer', 'mtg')).not.toContain('read')
     expect(reviewerAgent('mtg')).toContain('no 🔴 blocking and no 🟠 major')
@@ -159,9 +151,50 @@ test('the rules of a workspace reach its sessions, placeholders filled', () => {
   expect(reviewerAgent('acme/core/acme-backend')).toContain('Apply /app/acme/review.md.')
   expect(reviewerAgent('mtg')).not.toContain('review.md')
   expect(workerBrief('orch', { id: 3, repo: 'acme/core/acme-backend', text: 'ACME-3 x', branchFrom: 'develop', round: 1, report: '', reviews: [] } as unknown as Task)).toContain('git switch -c <key> develop')
-  // What hooks/repos.py --workspaces prints: entries without a folder are left out.
-  expect(parseWorkspaces(JSON.stringify([{ path: 'a', tickets: null }, { roles: {} }, { path: '' }]))).toEqual([{ path: 'a', tickets: null }])
-  expect(parseWorkspaces('not json')).toEqual([])
+})
+
+test('a faulty workspace file is named, its faulty part dropped, the rest kept', () => {
+  const read = parseWorkspaces(
+    JSON.stringify([
+      { path: 'a', file: 'a/orchestra.json', tickets: { name: 'T', key: 'T-(', worker: [] }, parallel: 2 },
+      { path: 'b', file: 'b/cfg/orchestra.json', error: 'not readable JSON (line 1)' },
+      { roles: {} },
+      { path: '', file: 'orchestra.json', newApp: 'compose' },
+      { path: 'c', roles: { byRepo: [['front', 'lead-frontend']] }, checks: { '.': 'go test' }, checkTimeout: 900 },
+    ]),
+  )
+  // Path '' is the root's own file.
+  expect(read.workspaces.map(w => w.path)).toEqual(['a', '', 'c'])
+  expect(read.workspaces[0]).toMatchObject({ parallel: 2 })
+  expect(read.workspaces[0]?.tickets).toBeUndefined()
+  expect(read.workspaces[2]?.checks).toBeUndefined()
+  expect(read.errors).toEqual([
+    'a/orchestra.json: tickets key "T-(" is not a valid regex; ignored',
+    'b/cfg/orchestra.json: not readable JSON (line 1); the whole file is ignored',
+    'orchestra.json: newApp must be a list of lines; ignored',
+    'c: checks must map a repo path to a list of commands; ignored',
+    'c: checkTimeout must be a whole number of seconds from 1 to 600; ignored',
+  ])
+  expect(parseWorkspaces('not json')).toEqual({ workspaces: [], errors: [] })
+})
+
+test('an inner workspace folder refines the outer one', () => {
+  setWorkspaces([
+    { ...(WORKSPACES[0] as Workspace), checks: { '*': ['make lint'] } },
+    { path: 'acme/core', checks: { 'acme-backend': ['go vet ./...'] }, roles: { default: 'dba' }, parallel: 3 },
+  ])
+  try {
+    expect(checksFor('acme/core/acme-backend')).toEqual(['go vet ./...', 'make lint'])
+    expect(checksFor('acme/core/acme-frontend')).toEqual(['make lint'])
+    expect(roleFor('acme/core/acme-backend', 'x').role).toBe('dba')
+    // The outer roles stay known beside the inner ones.
+    expect(roleFor('acme/core/acme-backend', 'x @tech-writer').role).toBe('tech-writer')
+    expect(parallelFor('acme/core/acme-backend')).toBe(3)
+    expect(parallelFor('acme/datalodestar')).toBe(1)
+    expect(describe('acme/core/acme-backend').join('\n')).toContain('Checks before review: go vet ./... && make lint')
+  } finally {
+    setWorkspaces(WORKSPACES)
+  }
 })
 
 test('reads a verdict and its findings', async () => {
@@ -254,7 +287,7 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
       value:
         reply === null
           ? { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' }
-          : { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } },
+          : { isAnswered: true, text: reply, usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
     } as never
   })
   // Briefs go through the SendMessage tool (the idle subscription rides on it); a call
@@ -299,16 +332,68 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     alerts.push(String(e.message))
     return { result: { sent: true } }
   })
+  // Folders: missing ones, ones that are not a repo yet, repos with no commit, repos with no remote.
+  const missing = new Set<string>()
+  const fresh = new Set<string>()
+  const unborn = new Set<string>()
+  const noIdentity = new Set<string>()
+  const noRemote = new Set<string>()
+  // The exit codes the orchestrator's checks get, in order (0 once they run out).
+  const checkExits: number[] = []
+  const files = new Map<string, string>()
+  on('fs.exists', (_$, e) => ({ value: !missing.has(e.path) }) as never)
+  on('fs.read', (_$, e) => {
+    const text = files.get(e.path)
+    if (text === undefined) {
+      throw new Error(`ENOENT: ${e.path}`)
+    }
+    return { value: text } as never
+  })
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined } as never
+  })
+  const done = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: exitCode ? 'fatal: fake failure' : '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('process.run', (_$, e) => {
     const [cmd, sub, ...rest] = e.argv
     commands.push([...e.argv])
     let stdout = ''
+    const dir = e.argv.includes('-C') ? e.argv[e.argv.indexOf('-C') + 1] ?? '' : ''
+    if (cmd === 'git' && fresh.has(dir)) {
+      if (e.argv.includes('init')) {
+        fresh.delete(dir)
+        unborn.add(dir)
+        noIdentity.add(dir)
+        return done('')
+      }
+      return done('', 128)
+    }
+    if (cmd === 'git' && unborn.has(dir) && e.argv.includes('commit')) {
+      unborn.delete(dir)
+      return done('')
+    }
+    if (cmd === 'git' && unborn.has(dir) && e.argv.includes('--verify')) {
+      return done('', 1)
+    }
+    if (cmd === 'git' && e.argv.includes('config') && e.argv.includes('user.email')) {
+      return done(noIdentity.has(dir) ? '' : 'me@example.com\n', noIdentity.has(dir) ? 1 : 0)
+    }
+    if (cmd === 'git' && e.argv.includes('remote') && noRemote.has(dir)) {
+      return done('', 2)
+    }
+    if (cmd === 'sh') {
+      const exit = checkExits.shift() ?? 0
+      return done(exit ? 'lint: 3 problems\nsrc/a.go:4: unused variable x' : 'ok\n', exit)
+    }
     if (cmd === 'python3' && e.argv[2] === '--workspaces') {
-      stdout = JSON.stringify(WORKSPACES)
+      stdout = JSON.stringify(served)
     } else if (cmd === 'python3') {
       stdout = python(e.argv)
     } else if (cmd === 'git' && e.argv.includes('--verify') && e.argv.some(a => a.startsWith('nope'))) {
       return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    } else if (cmd === 'git' && e.argv.includes('--show-toplevel')) {
+      // Every repo of the tests is a repo of its own, with commits; a folder under mtg/ is inside mtg.
+      stdout = dir.startsWith('/app/mtg/') ? '/app/mtg\n' : `${dir}\n`
     } else if (cmd === 'git') {
       stdout = e.argv.includes('--abbrev-ref') ? 'main\n' : e.argv.includes('--show-current') ? 'main\n' : 'abc123\n'
     } else if (cmd === 'gh') {
@@ -352,6 +437,11 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     refuseSends: (reason: string | null) => {
       refuse = reason
     },
+    missing,
+    fresh,
+    noRemote,
+    checkExits,
+    files,
     kill: (name: string) => {
       running.delete(name)
     },
@@ -707,7 +797,8 @@ test('/orch prompt without a repo: the model picks it, one task per repo', async
   const ran = await orch($, 'prompt ACME-7400 show the collection day on the issue page model:opus')
 
   expect(asked[0]?.prompt).toContain('- acme/core/acme-backend — API REST cœur métier Acme')
-  expect(asked[0]?.prompt).toContain('- acme/datalodestar — Graphical database client (no ticket tracker)')
+  expect(asked[0]?.prompt).toContain('- acme/datalodestar — Graphical database client\n')
+  expect(asked[0]?.prompt).toContain('Ticket trackers: tracker ACME; a task is a ticket task only when the request names a key.')
   expect(asked[0]?.prompt).toContain('Request:\nACME-7400 show the collection day on the issue page')
   expect(asked[0]?.prompt).not.toContain('model:')
   expect(launched.map(l => [l.name, l.agent])).toEqual([
@@ -850,10 +941,11 @@ test('a routed request chains its tasks by position', async ($, on) => {
   expect(launched.map(l => l.name)).toEqual(['orch-lead-backend-acme-backend'])
 })
 
-test('a ticket worker without a key searches the tracker before it blocks; a repo with an integration suite runs it', async ($, on) => {
+test('a worker without a key gets no ticket rules; a repo with an integration suite runs it', async ($, on) => {
   const { launched } = world(on)
   await orch($, 'task acme/core/acme-backend fix the export')
-  expect(launched[0]?.prompt).toContain('No key in the task: search the tracker yourself first')
+  expect(launched[0]?.prompt).toContain('never look for or ask for a key')
+  expect(launched[0]?.prompt).not.toContain('ACME-<n>')
   expect(launched[0]?.prompt).toContain('BRANCH: <the task branch')
   expect(launched[0]?.prompt).not.toContain('integration suite')
 
@@ -1121,4 +1213,336 @@ test('no session runs on haiku: a review sized to haiku is raised to sonnet, eff
   expect(launched[1]).toMatchObject({ name: 'orch-review-1-r1', model: 'sonnet', effort: 'low' })
   expect(launched.map(l => l.model)).not.toContain('haiku')
   expect(SIZING_SYSTEM).toContain('Haiku is never used.')
+})
+
+/** Lets the checks, started from a timer, run to their end: each step of theirs waits on the engine. */
+const drain = async (clock: { advance: (ms: number) => Promise<unknown> }) => {
+  for (let i = 0; i < 30; i += 1) {
+    await clock.advance(10)
+  }
+}
+
+const pane = ($: Parameters<TestBody>[0]) =>
+  $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+
+
+test('a folder that is not a git repo gets git init and an empty first commit, local only', async ($, on) => {
+  const { launched, commands, fresh, missing } = world(on)
+  fresh.add('/app/newapp')
+  await orch($, 'task newapp build the app')
+  expect(commands).toContainEqual(['git', '-C', '/app/newapp', 'init', '--quiet', '--initial-branch=main'])
+  // No identity in the new repo: the first commit says it is the orchestrator's.
+  expect(commands).toContainEqual(['git', '-C', '/app/newapp', '-c', 'user.name=Orchestra', '-c', 'user.email=orchestra@localhost', 'commit', '--allow-empty', '--quiet', '-m', 'chore: initial commit'])
+  expect(commands.some(c => c[0] === 'git' && c.includes('remote'))).toBe(false)
+  expect(launched).toHaveLength(1)
+  expect(launched[0]?.prompt).toContain('Repo: /app/newapp')
+
+  // A folder that does not exist is not created: a typo would make a stray repo.
+  missing.add('/app/typo')
+  await orch($, 'task typo do it')
+  expect(launched).toHaveLength(1)
+  const ui = await pane($)
+  expect(await stateOf(ui, 2)).toBe('⏸ blocked')
+  expect(commands.some(c => c.includes('/app/typo') && c.includes('init'))).toBe(false)
+
+  // Nor is a subfolder of another repo: no repo nested in a repo.
+  await orch($, 'task mtg/backend add an endpoint')
+  expect(await stateOf(ui, 3)).toBe('⏸ blocked')
+  expect(commands.some(c => c.includes('/app/mtg/backend') && c.includes('init'))).toBe(false)
+})
+
+test('an approved task in a repo with no remote gets no pull request', async ($, on) => {
+  const { noRemote } = world(on)
+  noRemote.add('/app/mtg')
+  await orch($, 'task mtg add the deck page')
+  await receive($, 'orch-developer-mtg', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/deck-page')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  expect((await orch($, 'pr 1')).text).toContain('local repo with no remote (origin): nothing to push')
+})
+
+test('the orchestrator runs the checks before a review: a failure goes back to the worker, no review spent', async ($, on) => {
+  const { launched, sent, checkExits, commands, clock } = world(on)
+  serve([{ ...(WORKSPACES[0] as Workspace), checks: { '*': ['make lint'] } }])
+  try {
+    checkExits.push(1)
+    await orch($, 'task acme/core/acme-backend fix the export')
+    await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/export')
+    // The checks start from a timer, outside the queue's turn.
+    await drain(clock)
+    expect(commands).toContainEqual(['sh', '-c', 'make lint'])
+    expect(launched.filter(l => l.name.startsWith('orch-review-'))).toHaveLength(0)
+    expect(sent.at(-1)?.to).toBe('orch-lead-backend-acme-backend')
+    expect(sent.at(-1)?.text).toContain('Checks failed before review')
+    expect(sent.at(-1)?.text).toContain('src/a.go:4: unused variable x')
+
+    await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: fixed\nBRANCH: feat/export')
+    await drain(clock)
+    const review = launched.find(l => l.name === 'orch-review-1-r1')
+    expect(review?.prompt).toContain('already ran the repo\'s checks on this code, green: make lint')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('checks that keep failing hand the task to the person', async ($, on) => {
+  const { launched, checkExits, alerts, clock } = world(on)
+  serve([{ ...(WORKSPACES[0] as Workspace), checks: { '*': ['make lint'] } }])
+  try {
+    checkExits.push(1, 1, 1)
+    await orch($, 'task acme/core/acme-backend fix the export')
+    for (let i = 0; i < 3; i += 1) {
+      await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/export')
+      await drain(clock)
+    }
+    expect(launched.filter(l => l.name.startsWith('orch-review-'))).toHaveLength(0)
+    expect(await stateOf(await pane($), 1)).toBe('⏸ blocked')
+    expect(alerts.at(-1)).toBe('Task #1 blocked: its checks still fail after 2 fixes')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('/orch followup queues the remaining remarks of an approved task, from its branch', async ($, on) => {
+  const { launched, sent } = world(on)
+  await orch($, 'task acme/core/acme-backend fix the export')
+  await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/export')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n- ⚪ Export.php:40 — long line — split it')
+  const ran = await orch($, 'followup 1 keep it short')
+  expect(ran.text).toContain('Follow-up of #1 queued as #2')
+  expect(ran.text).toContain('Branch starts from feat/export (asked).')
+  // The idle worker of #1 takes it.
+  expect(launched).toHaveLength(2)
+  const brief = sent.at(-1)?.text ?? ''
+  expect(brief).toContain('Export.php:40 — long line — split it')
+  expect(brief).toContain('The person adds: keep it short')
+  expect(brief).toContain('git switch -c <branch> feat/export')
+  expect((await orch($, 'followup 2')).text).toContain('only an approved task gets a follow-up')
+})
+
+test('/orch answer settles the questions of an unclear request, then queues it', async ($, on) => {
+  let questions = true
+  const { launched, asked } = world(on, JSON.stringify(SIZING), e =>
+    e.system?.includes('Prompt Manager')
+      ? JSON.stringify(questions ? { status: 'unclear', questions: ['CSV or PDF?'] } : { status: 'ready', title: 'Fix the CSV export', brief: '## Objective\nCSV.' })
+      : JSON.stringify(SIZING),
+  )
+  expect((await orch($, 'answer csv')).text).toBe('No question is waiting for an answer.')
+  expect((await orch($, 'prompt acme/core/acme-backend fix the export')).text).toContain('Answer with /orch answer')
+  questions = false
+  const ran = await orch($, 'answer CSV only')
+  expect(ran.text).toContain('Task #1 queued in acme/core/acme-backend')
+  expect(asked.at(-2)?.prompt).toContain('- CSV or PDF?\n→ CSV only')
+  expect(launched).toHaveLength(1)
+  expect((await orch($, 'answer again')).text).toBe('No question is waiting for an answer.')
+})
+
+test('a faulty workspace file is said in every /orch answer and in /orch config', async ($, on) => {
+  const { onPython } = world(on)
+  onPython(argv => (argv[2] === '--workspaces' ? '' : '{}'))
+  // The world answers the workspaces itself; a faulty file comes as an error entry.
+  const ran = await orch($, 'config acme/core/acme-backend')
+  expect(ran.text).toContain('acme/core/acme-backend: workspace acme')
+  expect(ran.text).toContain('Tickets: only when the request names a key (tracker ACME')
+  expect(ran.text).not.toContain('⚠ Workspace config')
+})
+
+test('a second task in a repo that allows two runs in a local clone, brought back on approval', async ($, on) => {
+  const { launched, commands } = world(on)
+  serve([{ ...(WORKSPACES[0] as Workspace), parallel: 2 }])
+  try {
+    await orch($, 'task acme/core/acme-backend first')
+    await orch($, 'task acme/core/acme-backend second')
+    await orch($, 'task acme/core/acme-backend third')
+    expect(launched.map(l => l.name)).toEqual(['orch-lead-backend-acme-backend', 'orch-lead-backend-acme-backend-2'])
+    const clone = '/app/.orchestra/clones/acme-core-acme-backend-2'
+    expect(commands).toContainEqual(['git', 'clone', '--quiet', '--no-checkout', '/app/acme/core/acme-backend', clone])
+    expect(launched[1]?.prompt).toContain(`Repo: ${clone} (work only there)`)
+    expect(launched[1]?.prompt).toContain('This is a local clone of /app/acme/core/acme-backend')
+    await receive($, 'orch-lead-backend-acme-backend-2', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/second')
+    expect(launched.at(-1)?.prompt).toContain(`git -C ${clone} log`)
+    await receive($, 'orch-review-2-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+    expect(commands).toContainEqual(['git', '-C', '/app/acme/core/acme-backend', 'fetch', '--quiet', clone, 'feat/second:feat/second'])
+    expect(commands).toContainEqual(['rm', '-rf', clone])
+    // The third waited for a place, and takes the freed one.
+    expect(launched.at(-1)?.prompt).toContain('third')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('finished tasks are kept, and the sizing sees them; the orchestrator calls count in the cost', async ($, on) => {
+  const { asked, files } = world(on)
+  await orch($, 'task acme/core/acme-backend fix the export')
+  await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/export')
+  await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+  const kept = [...files].find(([path]) => path.endsWith('/orchestra/history.json'))
+  const history = JSON.parse(kept?.[1] ?? '[]') as HistoryEntry[]
+  expect(history).toHaveLength(1)
+  expect(history[0]).toMatchObject({ repo: 'acme/core/acme-backend', role: 'lead-backend', outcome: 'approved', rounds: 1, checkFixes: 0 })
+  // One sizing call on fable: 1000 in × $10/M + 200 out × $50/M.
+  expect(Math.abs((history[0]?.cost ?? 0) - 0.02)).toBeLessThan(1e-9)
+
+  await orch($, 'task acme/core/acme-backend second fix')
+  expect(asked.at(-1)?.prompt).toContain('Past tasks (setting → outcome, cost):')
+  expect(asked.at(-1)?.prompt).toContain('- acme/core/acme-backend · lead-backend · dev opus·high · review opus·xhigh → approved after 1 round(s), ≈$0.02 · fix the export')
+})
+
+test('a new app made by the orchestrator gets the rules of every new app; an existing repo does not', async ($, on) => {
+  const { launched, fresh } = world(on)
+  const ROOT_RULES: Workspace = { path: '', newApp: ['It runs under Docker Compose: a compose.yaml at the repo root starts it with docker compose up.'] }
+  serve([...WORKSPACES, ROOT_RULES])
+  try {
+    fresh.add('/app/newapp')
+    await orch($, 'task newapp build the app')
+    expect(launched[0]?.prompt).toContain('This is a new app. Every new app must meet these rules, as part of this task:\n  - It runs under Docker Compose')
+    await receive($, 'orch-developer-newapp', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/app')
+    expect(launched[1]?.prompt).toContain('This is a new app: it must meet these rules, and one not met is a 🔴 finding:\n- It runs under Docker Compose')
+
+    // A repo that already has commits is no new app, even under the same root rules.
+    await orch($, 'task acme/core/acme-backend fix the export')
+    expect(launched.at(-1)?.prompt).not.toContain('new app')
+    expect((await orch($, 'config newapp')).text).toContain('Rules for a new app: It runs under Docker Compose')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+/** Roles every repo under the root knows, as /app/orchestra.json declares them. */
+const ROOT_ROLES: Workspace = { path: '', roles: { list: { 'lead-backend': 'engineering', 'lead-frontend': 'engineering', dba: 'engineering' }, default: 'developer' } }
+
+test('/orch prompt splits a request by domain: one task per role, the UI after the API it calls', async ($, on) => {
+  const split = {
+    status: 'ready',
+    tasks: [
+      { role: 'lead-backend', title: 'Deck API', brief: 'Add the deck endpoints.' },
+      { role: 'lead-frontend', after: [0], title: 'Deck page', brief: 'Show the decks, from the new endpoints.' },
+    ],
+  }
+  const { launched, asked } = world(on, JSON.stringify(SIZING), e => (e.system?.includes('Prompt Manager') ? JSON.stringify(split) : JSON.stringify(SIZING)))
+  serve([...WORKSPACES, ROOT_ROLES])
+  try {
+    const ran = await orch($, 'prompt mtg add decks, API and page')
+    expect(asked[0]?.prompt).toContain('Roles for a split: lead-backend, lead-frontend, dba')
+    expect(ran.text).toContain('Task #1 queued in mtg for lead-backend')
+    expect(ran.text).toContain('Task #2 queued in mtg for lead-frontend')
+    expect(ran.text).toContain('Waits for #1 to be approved.')
+    expect(launched.map(l => l.agent)).toEqual(['orch-lead-backend'])
+
+    await receive($, 'orch-lead-backend-mtg', 'STATUS: done\nSUMMARY: endpoints added\nBRANCH: feat/deck-api')
+    await receive($, 'orch-review-1-r1', 'VERDICT: APPROVED\nFINDINGS:\n')
+    const front = launched.find(l => l.agent === 'orch-lead-frontend')
+    expect(front?.name).toBe('orch-lead-frontend-mtg')
+    // The UI builds on the API's branch.
+    expect(front?.prompt).toContain('git switch -c <branch> feat/deck-api')
+    expect(front?.prompt).toContain('#1 (mtg) Deck API: its work is on branch feat/deck-api')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('a role the person names wins over the split; a role the repo does not know falls back to the repo', async ($, on) => {
+  let reply: unknown = { status: 'ready', role: 'wizard', title: 'Fix', brief: 'Fix it.' }
+  const { launched } = world(on, JSON.stringify(SIZING), e => (e.system?.includes('Prompt Manager') ? JSON.stringify(reply) : JSON.stringify(SIZING)))
+  serve([...WORKSPACES, ROOT_ROLES])
+  try {
+    expect((await orch($, 'prompt mtg fix it')).text).toContain('queued in mtg for developer')
+    reply = { status: 'ready', tasks: [{ role: 'lead-frontend', title: 'A', brief: 'a' }, { role: 'lead-backend', title: 'B', brief: 'b' }] }
+    const ran = await orch($, 'prompt mtg do both @dba')
+    expect(ran.text).toContain('Task #2 queued in mtg for dba')
+    expect(ran.text).toContain('Task #3 queued in mtg for dba')
+    expect(launched[0]?.agent).toBe('orch-developer')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('routing may give one repo several tasks, by domain, each with its role', () => {
+  const routed = parseRouting(
+    JSON.stringify({
+      status: 'ready',
+      tasks: [
+        { repo: 'acme/datalodestar', role: 'dba', title: 'Schema', brief: 'S' },
+        { repo: 'acme/datalodestar', role: 'lead-frontend', after: [0], title: 'UI', brief: 'U' },
+      ],
+    }),
+    [{ repo: 'acme/datalodestar', about: '' }],
+  )
+  expect(routed).toEqual({
+    tasks: [
+      { repo: 'acme/datalodestar', role: 'dba', title: 'Schema', brief: 'S', after: [] },
+      { repo: 'acme/datalodestar', role: 'lead-frontend', title: 'UI', brief: 'U', after: [0] },
+    ],
+  })
+})
+
+const CARD = { title: 'Lead UI/UX & Frontend Developer', prompt: '# Lead UI/UX & Frontend Developer\n\nYou are the Lead UI/UX Designer and Frontend Developer of the project team.', file: '/opt/cortex/versions/1.1.1/agents/roles/engineering/lead-frontend.md' }
+
+test('a role card is the whole instructions of its agent; a workspace with no cards of its own keeps its cascade', () => {
+  setWorkspaces([
+    { path: '', roles: { list: { 'lead-frontend': 'engineering' }, cards: { 'lead-frontend': CARD }, worker: ["Before your first task, read the target repo's README."] } },
+    { ...(WORKSPACES[0] as Workspace), roles: { ...(WORKSPACES[0] as Workspace).roles, cards: {} } },
+  ])
+  try {
+    const agent = JSON.parse(workerAgent('lead-frontend', 'mtg'))['orch-lead-frontend'].prompt as string
+    expect(agent).toContain('----- role card -----\n# Lead UI/UX & Frontend Developer\n\nYou are the Lead UI/UX Designer')
+    expect(agent).toContain("read the target repo's own when they exist")
+    expect(agent).toContain("Before your first task, read the target repo's README.")
+    // The Acme workspace said it has no cards: its sessions read its own cascade.
+    const acme = JSON.parse(workerAgent('lead-frontend', 'acme/core/acme-frontend'))['orch-lead-frontend'].prompt as string
+    expect(acme).not.toContain('role card')
+    expect(acme).toContain('read /app/acme/roles/engineering/lead-frontend.md')
+    // The choice of a role sees what each card says it is.
+    expect(upgradePrompt('mtg', 'developer', 'x')).toContain('Roles for a split: lead-frontend (Lead UI/UX & Frontend Developer)')
+    expect(describe('mtg').join('\n')).toContain('Role cards: 1\n')
+  } finally {
+    setWorkspaces(WORKSPACES)
+  }
+})
+
+test('what the role cards folder could not give is said like any fault of the file', () => {
+  const read = parseWorkspaces(JSON.stringify([{ path: '', file: 'orchestra.json', roles: { from: ['/nope'] }, problems: ['roles.from: no folder of role cards at /nope'] }]))
+  expect(read.workspaces.map(w => w.path)).toEqual([''])
+  expect(read.errors).toEqual(['orchestra.json: roles.from: no folder of role cards at /nope'])
+})
+
+const THEME: Workspace['personality'] = {
+  from: '/claude-code/cortex/personalities/the-boys',
+  reviewerAs: 'qa-automation',
+  theme: '# The Boys Theme — Rules & Tone\n\nDark deadpan humour. NEVER sacrifice technical quality for humour.',
+  characters: {
+    'lead-frontend': { name: 'Hughie Campbell', alias: '@Hughie', card: "# Hughie Campbell\n\n\"Let's make it work for the person who never reads the manual.\"" },
+    'qa-automation': { name: 'Kimiko', alias: '@Kimiko', card: '# Kimiko\n\n"[signs] I break it first. Then nobody else can."' },
+  },
+}
+
+test('workers play their role\'s character, the reviewer the one of reviewerAs; the briefs stay neutral', () => {
+  setWorkspaces([{ path: '', roles: { list: { 'lead-frontend': 'engineering', 'qa-automation': 'engineering' } }, personality: THEME }, ...WORKSPACES])
+  try {
+    const worker = JSON.parse(workerAgent('lead-frontend', 'mtg'))['orch-lead-frontend'].prompt as string
+    expect(worker).toContain('You play Hughie Campbell')
+    expect(worker).toContain('----- theme -----\n# The Boys Theme')
+    expect(worker).toContain("----- character card -----\n# Hughie Campbell")
+    expect(worker).toContain('(STATUS:, SUMMARY:, BRANCH:, CHANGES:, TESTS:, NEEDS:, VERDICT:, FINDINGS:) keeps its exact form')
+    const reviewer = JSON.parse(reviewerAgent('mtg'))['orch-reviewer'].prompt as string
+    expect(reviewer).toContain('You play Kimiko')
+    // An inner workspace with no personality of its own plays the root's.
+    expect(JSON.parse(reviewerAgent('acme/core/acme-backend'))['orch-reviewer'].prompt).toContain('You play Kimiko')
+    // A role the theme does not cast plays no one.
+    expect(JSON.parse(workerAgent('developer', 'mtg'))['orch-developer'].prompt).not.toContain('You play')
+    // What the orchestrator writes for the sessions and its own model stays neutral.
+    const task = { id: 1, repo: 'mtg', role: 'lead-frontend', text: 'x', branchFrom: 'main', round: 1, report: '', reviews: [] } as unknown as Task
+    for (const text of [workerBrief('o', task), reviewBrief('o', task), upgradePrompt('mtg', 'lead-frontend', 'x'), UPGRADE_SYSTEM]) {
+      expect(text).not.toContain('Hughie')
+      expect(text).not.toContain('The Boys')
+    }
+    expect(describe('mtg').join('\n')).toContain('Personality: /claude-code/cortex/personalities/the-boys · lead-frontend = Hughie Campbell, qa-automation = Kimiko · reviewer = Kimiko')
+  } finally {
+    setWorkspaces(WORKSPACES)
+  }
+})
+
+test('without a personality, no session plays anyone', () => {
+  expect(JSON.parse(workerAgent('lead-frontend', 'acme/core/acme-frontend'))['orch-lead-frontend'].prompt).not.toContain('You play')
+  expect(JSON.parse(reviewerAgent('acme/core/acme-frontend'))['orch-reviewer'].prompt).not.toContain('You play')
+  expect(parseWorkspaces(JSON.stringify([{ path: 'x', personality: { reviewerAs: 3 } }])).errors).toEqual(['x: personality must be {from, reviewerAs?}; ignored'])
 })

@@ -4,14 +4,16 @@ Usage: python3 usage.py <transcript.jsonl>...
 Prints one JSON object keyed by path: the last model, the context the last request
 carried (input + cache read + cache write), and the totals of every assistant message,
 each message counted once, from its last line.
-Only the main thread is counted: subagents keep transcripts of their own.
+A session's subagents keep transcripts of their own, in <session>/subagents/*.jsonl next to
+it: they come under "subagents", summed by model.
 """
 
 import json
+import os
 import sys
 
 
-def summarise(path):
+def summarise(path, main_only=True):
     # A message spread over several lines repeats its usage, updated as it streams: the
     # last line of each message holds its final counts.
     last = {}
@@ -25,7 +27,10 @@ def summarise(path):
                 continue
             message = entry.get("message") or {}
             usage = message.get("usage")
-            if entry.get("type") != "assistant" or not isinstance(usage, dict) or entry.get("isSidechain"):
+            if entry.get("type") != "assistant" or not isinstance(usage, dict) or (entry.get("isSidechain") and main_only):
+                continue
+            # A synthetic message (an interrupted turn) costs nothing and has no model to price.
+            if (message.get("model") or "").startswith("<"):
                 continue
             key = message.get("id") or entry.get("uuid")
             last.pop(key, None)
@@ -46,10 +51,30 @@ def summarise(path):
     return {"model": model, "context": context, "turns": len(last), **totals}
 
 
+def subagents(path):
+    """The subagents of the session whose transcript is path, summed by model."""
+    folder = os.path.join(path[: -len(".jsonl")], "subagents") if path.endswith(".jsonl") else ""
+    by_model = {}
+    # Workflow runs keep theirs one level down, under subagents/workflows/<run>/.
+    files = [os.path.join(top, name) for top, _dirs, names in os.walk(folder) for name in names if name.endswith(".jsonl")] if folder else []
+    for file in sorted(files):
+        try:
+            sub = summarise(file, main_only=False)
+        except OSError:
+            continue
+        # A synthetic message (an interrupted turn) costs nothing and has no model to price.
+        if sub["turns"] == 0 or sub["model"].startswith("<"):
+            continue
+        total = by_model.setdefault(sub["model"], {"model": sub["model"], "context": 0, "turns": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite5m": 0, "cacheWrite1h": 0})
+        for key in ("turns", "input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"):
+            total[key] += sub[key]
+    return list(by_model.values())
+
+
 result = {}
 for path in sys.argv[1:]:
     try:
-        result[path] = summarise(path)
+        result[path] = {**summarise(path), "subagents": subagents(path)}
     except OSError:
         pass
 print(json.dumps(result))
