@@ -1,0 +1,64 @@
+{
+  "root": "../..",
+  "roles": {
+    "from": "/opt/cortex/versions/1.1.1/agents/roles",
+    "byRepo": [
+      [
+        "frontend|design|(^|[/-])(front|web|ui)([/-]|$)",
+        "lead-frontend"
+      ],
+      [
+        "e2e|playwright",
+        "qa-automation"
+      ],
+      [
+        "database|migrations",
+        "dba"
+      ],
+      [
+        "infra|iac|deploy",
+        "platform-engineer"
+      ],
+      [
+        "backend|api",
+        "lead-backend"
+      ]
+    ],
+    "default": "developer",
+    "light": [
+      "tech-writer",
+      "data-analyst",
+      "business-analyst",
+      "product-owner"
+    ],
+    "worker": [
+      "Before your first task, read the target repo's README."
+    ]
+  },
+  "newApp": [
+    "It runs under Docker Compose: a compose.yaml at the repo root declares every service the app needs (the app built from its own Dockerfile, and any database, cache or worker it uses), so that `docker compose up` starts it with no other step.",
+    "Data lives in named volumes, not in bind mounts of host folders; ports and settings come from environment variables with working defaults, documented in a .env.example.",
+    "The README says how to start, stop and reset it with Docker Compose.",
+    "Check it before reporting: `docker compose config` and `docker compose build` pass, and the app answers once `docker compose up -d` has started it; stop it again afterwards (`docker compose down`). From this container, Docker sees /app as the host's ~/dev: run compose with `--project-directory /home/dremsis/dev/<repo>` when a relative path matters."
+  ],
+  "personality": {
+    "from": "/claude-code/cortex/personalities/the-boys",
+    "reviewerAs": "qa-automation"
+  },
+  "review": {
+    "docs": [
+      "/opt/cortex/versions/1.1.1/agents/workflows/engineering/code-review.md"
+    ]
+  },
+  "capabilities": {
+    "from": "/opt/cortex/versions/1.1.1/agents/capabilities"
+  },
+  "workflows": {
+    "from": "/opt/cortex/versions/1.1.1/agents/workflows"
+  },
+  "practices": {
+    "docs": [
+      "/claude-code/cortex/practices/engineering.md"
+    ]
+  }
+}
