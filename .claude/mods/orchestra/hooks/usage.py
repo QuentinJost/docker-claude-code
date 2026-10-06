@@ -17,6 +17,7 @@ def summarise(path, main_only=True):
     # A message spread over several lines repeats its usage, updated as it streams: the
     # last line of each message holds its final counts.
     last = {}
+    action, action_at = "", ""
     with open(path, encoding="utf-8", errors="replace") as lines:
         for line in lines:
             if '"usage"' not in line:
@@ -32,6 +33,9 @@ def summarise(path, main_only=True):
             # A synthetic message (an interrupted turn) costs nothing and has no model to price.
             if (message.get("model") or "").startswith("<"):
                 continue
+            for part in message.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "tool_use":
+                    action, action_at = describe(part), entry.get("timestamp") or action_at
             key = message.get("id") or entry.get("uuid")
             last.pop(key, None)
             last[key] = (message.get("model") or "", usage)
@@ -48,7 +52,14 @@ def summarise(path, main_only=True):
         totals["cacheWrite5m"] += max(0, written - hour)
         model = model_id or model
         context = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) + written
-    return {"model": model, "context": context, "turns": len(last), **totals}
+    return {"model": model, "context": context, "turns": len(last), **totals, "last": action, "lastAt": action_at}
+
+
+def describe(tool_use):
+    """One short line for a tool call: its name and what it works on."""
+    given = tool_use.get("input") or {}
+    what = given.get("description") or given.get("file_path") or given.get("command") or given.get("pattern") or given.get("to") or ""
+    return f"{tool_use.get('name', '?')}: {' '.join(str(what).split())}"[:120].rstrip(": ")
 
 
 def subagents(path):

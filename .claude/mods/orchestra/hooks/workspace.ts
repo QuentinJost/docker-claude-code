@@ -51,7 +51,10 @@ export type Target = {
 }
 
 /** A role card read from a folder of cards (cortex's agents/roles): what the role's agent is. */
-export type RoleCard = { title: string; prompt: string; file: string }
+export type RoleCard = { title: string; prompt: string; file: string; overlay?: string; semantic?: string }
+
+/** An indexed file set (a capability card, a workflow): its title, and its files, base first. */
+export type Indexed = { title: string; files: string[] }
 
 /** A character of a personality theme: who plays a role. */
 export type Character = { name: string; alias: string; card: string }
@@ -71,6 +74,8 @@ export type Roles = {
   from?: string | string[]
   /** The cards read from `from`: each one is the whole instructions of its role's agent. */
   cards?: Record<string, RoleCard>
+  /** A folder of workspace overlays of the cards, same layout: each is added after its base. */
+  overlays?: string
   /** Every role a task may name with `@role`, with its folder. */
   list?: Record<string, string>
   /** The role by repo path (relative to the workspace), first match wins: [regex source, role]. */
@@ -94,7 +99,8 @@ export type Workspace = {
   /**
    * Commands the orchestrator itself runs in a repo before a review, by repo path relative to the
    * workspace (`.` for the workspace folder itself, `*` for every repo of it): a failing one sends
-   * the task back to its worker with the output, and spares a review session.
+   * the task back to its worker with the output, and spares a review session. `{base}` in a command is the commit the
+   * task branch started from (`git diff --name-only {base}` lists the task's files).
    */
   checks?: Record<string, string[]>
   /** How long one check may run, in seconds: 1 to 600, the engine's limit for a command (default 600). */
@@ -117,6 +123,14 @@ export type Workspace = {
   route?: string[]
   /** A personality theme the workers (and the reviewer, if `reviewerAs` says so) play. */
   personality?: Personality
+  /** Conventions every worker follows and every reviewer holds the work to: `docs`, read into `texts`; `docs: []` for none here. */
+  practices?: { docs?: string[]; texts?: { file: string; text: string; semantic: string }[] }
+  /** The reviewer's rules: `docs`, files read in order (a base, then overlays) into `texts`. */
+  review?: { docs?: string[]; texts?: { file: string; text: string; semantic: string }[] }
+  /** Capability cards (cortex capabilities/), indexed by name: a worker gets the paths of those its repo's stack uses. */
+  capabilities?: { from?: string | string[]; index?: Record<string, Indexed> }
+  /** Workflows (cortex workflows/ and the workspace's), indexed by name: a task may follow one. */
+  workflows?: { from?: string | string[]; index?: Record<string, Indexed> }
   /**
    * What every new app must meet: lines for the worker and the reviewer of a task whose folder the
    * orchestrator just made a repo (git init, or a first commit), e.g. running under Docker Compose.
@@ -243,6 +257,9 @@ const chainOf = (repo: string): Workspace[] => workspaces.filter(ws => inside(re
 
 const MERGED = ['roles', 'checks', 'integration', 'targets'] as const
 
+/** The workflow that is the reviewer's, never a task's. */
+export const REVIEW_WORKFLOW = 'engineering/code-review'
+
 /**
  * The rules in force for a repo: its workspaces merged from the outermost in, so an inner folder's
  * file refines the outer one's. Repo-relative keys (checks, integration) are rewritten relative to
@@ -366,6 +383,23 @@ export const reviewerCharacter = (repo: string): { theme: string; character: Cha
   return role ? characterFor(role, repo) : null
 }
 
+/** The reviewer's rules in a repo's workspaces: the texts of review.docs, base first. */
+export const reviewTexts = (repo: string): { file: string; text: string; semantic: string }[] =>
+  (workspaceOf(repo) ?? targetOf(repo)?.ws)?.review?.texts ?? []
+
+/** The conventions of a repo's workspaces that every worker and reviewer gets. */
+export const practiceTexts = (repo: string): { file: string; text: string }[] => (workspaceOf(repo) ?? targetOf(repo)?.ws)?.practices?.texts ?? []
+
+/** The capability cards a repo's workspace offers, by name (`languages/php`). */
+export const capabilityIndex = (repo: string): Record<string, Indexed> => (workspaceOf(repo) ?? targetOf(repo)?.ws)?.capabilities?.index ?? {}
+
+/** The workflows a repo's workspace offers (any workspace's, for none), the reviewer's left out. */
+export const workflowIndex = (repo: string | null): Record<string, Indexed> => {
+  const all: Record<string, Indexed> =
+    repo === null ? Object.assign({}, ...workspaces.map(w => w.workflows?.index ?? {})) : (workspaceOf(repo) ?? targetOf(repo)?.ws)?.workflows?.index ?? {}
+  return Object.fromEntries(Object.entries(all).filter(([name]) => name !== REVIEW_WORKFLOW))
+}
+
 /** The roles of a repo (any workspace's, for none), each with what its card says it is: `lead-frontend (Lead UI/UX & Frontend Developer)`. */
 export const roleSummaries = (repo: string | null): string[] => {
   const cards: Record<string, RoleCard> =
@@ -429,6 +463,9 @@ export const describe = (repo: string): string[] => {
   return [
     `${repo}: ${ws ? `workspace ${ws.path || ROOT} (from ${chain.reverse().join(' → ')})` : 'no workspace: generic rules'}`,
     `Role by default: ${repoRole(repo)}${ws?.roles?.list ? ` · roles known: ${Object.keys(ws.roles.list).join(', ')}` : ''}`,
+    `Reviewer's rules: ${reviewTexts(repo).map(t => t.file).join(' + ') || 'the generic ones'}`,
+    `Practices: ${practiceTexts(repo).map(t => t.file).join(' + ') || 'none'}`,
+    `Capability cards offered: ${Object.keys(capabilityIndex(repo)).length}, workflows: ${Object.keys(workflowIndex(repo)).join(', ') || 'none'}`,
     `Role cards: ${Object.keys(ws?.roles?.cards ?? {}).length ? `${Object.keys(ws?.roles?.cards ?? {}).length}${ws?.roles?.from ? `, from ${String(ws.roles.from)}` : ''}` : 'none (each session reads what its workspace tells it)'}`,
     `Tickets: ${trackers().length ? `only when the request names a key (${trackers().map(t => `${t.name}: ${t.key}`).join('; ')})` : 'none declared'}`,
     `Checks before review: ${checksFor(repo).join(' && ') || 'none'}`,

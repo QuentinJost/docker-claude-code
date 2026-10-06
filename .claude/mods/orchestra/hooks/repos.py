@@ -14,7 +14,13 @@ a folder of repos), comes as {"path", "file", "error"}, so the orchestra can say
 
 A workspace's "roles": {"from": ...} names a folder of role cards, laid out as cortex's
 agents/roles/<folder>/<role>.md (a path, or a list whose first existing one wins; $VARS are
-expanded): every card becomes a role of "roles.list", and its title and text go in "roles.cards". "from": "" says the workspace has no cards of its own.
+expanded): every card becomes a role of "roles.list", and its title and text go in "roles.cards". "from": "" says the workspace has no cards of its own; "roles": {"overlays": <folder>} adds each
+card's workspace overlay, same layout, with its semantic (additive or replacement).
+
+"review": {"docs": [paths]} are read into "review.texts" (the reviewer's rules, base first), and
+"practices": {"docs": [paths]} into "practices.texts" (conventions every worker and reviewer holds);
+"capabilities": {"from": ...} and "workflows": {"from": [...]} are indexed by name (path under
+the folder, without .md) with their title and files, a later folder's overlay kept after its base.
 
 A workspace's "personality": {"from": <theme folder>} names a cortex personality theme
 (theme.md, characters.md and one card per character): theme.md goes in "personality.theme", and
@@ -104,7 +110,87 @@ def with_cards(entry):
         shown = source if isinstance(source, str) else ", ".join(map(str, source))
         return {**entry, "problems": [f"roles.from: no folder of role cards at {shown}"]}
     folder, listed, cards = read
-    return {**entry, "roles": {**roles, "from": folder, "list": {**listed, **(roles.get("list") or {})}, "cards": cards}}
+    problems = []
+    overlays = roles.get("overlays")
+    if isinstance(overlays, str) and overlays:
+        if os.path.isdir(os.path.expandvars(overlays)):
+            for role, group in listed.items():
+                text = read_text(os.path.join(os.path.expandvars(overlays), group, f"{role}.md"))
+                if text is not None:
+                    cards[role] = {**cards[role], "overlay": text[:CARD_MAX], "semantic": semantic(text)}
+        else:
+            problems.append(f"roles.overlays: no folder at {overlays}")
+    out = {**entry, "roles": {**roles, "from": folder, "list": {**listed, **(roles.get("list") or {})}, "cards": cards}}
+    return {**out, "problems": [*entry.get("problems", []), *problems]} if problems else out
+
+
+def read_text(path):
+    """A text file's content, or None when it cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as text:
+            return text.read().strip()
+    except OSError:
+        return None
+
+
+def semantic(text):
+    """What an overlay does to its base, from its OVERLAY header: additive or replacement."""
+    found = re.search(r"Semantic:\s*(\w+)", text[:600])
+    return found.group(1).lower() if found else "additive"
+
+
+def title_of(text, fallback):
+    return next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), fallback)
+
+
+def with_docs(entry):
+    """The workspace entry with review.docs, capabilities.from and workflows.from read in."""
+    problems = list(entry.get("problems", []))
+    practices = entry.get("practices")
+    if isinstance(practices, dict) and isinstance(practices.get("docs"), list):
+        texts = []
+        for path in practices["docs"]:
+            text = read_text(os.path.expandvars(str(path)))
+            if text is None:
+                problems.append(f"practices.docs: cannot read {path}")
+            else:
+                texts.append({"file": str(path), "text": text[:2 * CARD_MAX], "semantic": "base"})
+        entry = {**entry, "practices": {**practices, "texts": texts}}
+    review = entry.get("review")
+    if isinstance(review, dict) and isinstance(review.get("docs"), list):
+        texts = []
+        for path in review["docs"]:
+            text = read_text(os.path.expandvars(str(path)))
+            if text is None:
+                problems.append(f"review.docs: cannot read {path}")
+            else:
+                texts.append({"file": str(path), "text": text[:2 * CARD_MAX], "semantic": semantic(text) if text.startswith("<!-- OVERLAY") else "base"})
+        entry = {**entry, "review": {**review, "texts": texts}}
+    # Capability cards and workflows: an index of the files (not their text), later folders winning.
+    for key, problem in (("capabilities", "capabilities.from"), ("workflows", "workflows.from")):
+        section = entry.get(key)
+        if not isinstance(section, dict) or "from" not in section:
+            continue
+        sources = section["from"] if isinstance(section["from"], list) else [section["from"]]
+        index = {}
+        for source in sources:
+            folder = os.path.expandvars(str(source))
+            if not os.path.isdir(folder):
+                problems.append(f"{problem}: no folder at {source}")
+                continue
+            for top, _dirs, names in os.walk(folder):
+                for name in sorted(names):
+                    if not name.endswith(".md") or name.lower() == "readme.md":
+                        continue
+                    path = os.path.join(top, name)
+                    item = os.path.relpath(path, folder)[: -len(".md")]
+                    text = read_text(path) or ""
+                    known = index.get(item)
+                    # A workflow overlay of a later folder keeps the base it extends.
+                    files = [*(known["files"] if known else []), path] if text.startswith("<!-- OVERLAY") else [path]
+                    index[item] = {"title": title_of(text, item), "files": files}
+        entry = {**entry, key: {**section, "index": index}}
+    return {**entry, "problems": problems} if problems else entry
 
 
 CHARACTER_ROW = re.compile(r"^\|\s*`([a-z0-9-]+)`\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|\s*\[[^\]]*\]\(([^)]+)\)")
@@ -169,7 +255,7 @@ def read_workspace(folder, root):
         inside = os.path.dirname(inside)
     entry = {key: value for key, value in config.items() if key != "root"}
     # The root's own file rules every repo under it: its path is "".
-    return with_personality(with_cards({**entry, "path": "" if ruled == root else os.path.relpath(ruled, root), "file": shown}))
+    return with_docs(with_personality(with_cards({**entry, "path": "" if ruled == root else os.path.relpath(ruled, root), "file": shown})))
 
 
 def folders(root, skip_under):

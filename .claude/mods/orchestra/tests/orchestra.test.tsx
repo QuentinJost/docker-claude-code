@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 
 import { deliveryFailure, isAutoModeHold, parseBackgrounded, parseListing } from '../hooks/parse'
 import { dollars, fillBar, toUsage } from '../hooks/usage'
-import { SIZING_SYSTEM, UPGRADE_SYSTEM, atLeast, hasTickets, reviewerAgent, workerAgent, parseRouting, parseNeeds, parseOverrides, parseSizing, parseStatus, parseUpgrade, parseVerdict, plan, reviewBrief, roleFor, upgradePrompt, workerBrief } from '../hooks/pipeline'
+import { SIZING_SYSTEM, capabilitiesFor, UPGRADE_SYSTEM, atLeast, hasTickets, reviewerAgent, workerAgent, parseRouting, parseNeeds, parseOverrides, parseSizing, parseStatus, parseUpgrade, parseVerdict, plan, reviewBrief, roleFor, upgradePrompt, workerBrief } from '../hooks/pipeline'
 import type { HistoryEntry, Task, Worker } from '../types'
 import { checksFor, describe, parallelFor, parseWorkspaces, setWorkspaces } from '../hooks/workspace'
 import type { Workspace } from '../hooks/workspace'
@@ -1545,4 +1545,143 @@ test('without a personality, no session plays anyone', () => {
   expect(JSON.parse(workerAgent('lead-frontend', 'acme/core/acme-frontend'))['orch-lead-frontend'].prompt).not.toContain('You play')
   expect(JSON.parse(reviewerAgent('acme/core/acme-frontend'))['orch-reviewer'].prompt).not.toContain('You play')
   expect(parseWorkspaces(JSON.stringify([{ path: 'x', personality: { reviewerAs: 3 } }])).errors).toEqual(['x: personality must be {from, reviewerAs?}; ignored'])
+})
+
+test('a card\'s workspace overlay follows the card; the reviewer gets its rules whole, base first, as a local review', () => {
+  setWorkspaces([
+    {
+      path: 'acme',
+      roles: {
+        list: { 'regulatory-compliance-writer': 'security-compliance' },
+        cards: { 'regulatory-compliance-writer': { title: 'Regulatory writer', prompt: '# Regulatory writer\n\nBase card.', file: 'x', overlay: '<!-- OVERLAY\n Semantic: additive -->\nTeam rule: French public law.', semantic: 'additive' } },
+      },
+      review: {
+        texts: [
+          { file: '/opt/cortex/…/code-review.md', text: '# Code review\n\nRule 1: verify every finding.', semantic: 'base' },
+          { file: '/app/acme/agents/…/code-review.md', text: '<!-- OVERLAY -->\n# Revue Acme\n\n🔴 Bloquant', semantic: 'replacement' },
+        ],
+      },
+    },
+  ])
+  try {
+    const worker = JSON.parse(workerAgent('regulatory-compliance-writer', 'acme/docs'))['orch-regulatory-compliance-writer'].prompt as string
+    expect(worker.indexOf('Base card.')).toBeLessThan(worker.indexOf('Team rule: French public law.'))
+    expect(worker).toContain("The workspace's overlay of that card follows (it adds to the card; where they differ, the overlay wins).")
+    const reviewer = JSON.parse(reviewerAgent('acme/docs'))['orch-reviewer'].prompt as string
+    expect(reviewer).toContain('This review is local: you publish nothing')
+    expect(reviewer.indexOf('Rule 1: verify every finding.')).toBeLessThan(reviewer.indexOf('# Revue Acme'))
+    expect(reviewer).toContain('----- overlay (replacement): /app/acme/agents/…/code-review.md -----')
+    expect(JSON.parse(reviewerAgent('mtg'))['orch-reviewer'].prompt).not.toContain('review rules')
+  } finally {
+    setWorkspaces(WORKSPACES)
+  }
+})
+
+test('a worker is pointed at the capability cards of its repo\'s stack', () => {
+  const index = Object.fromEntries(
+    ['languages/php', 'frameworks/symfony', 'frameworks/vue', 'languages/typescript', 'infrastructure/docker', 'databases/mysql', 'security/owasp', 'practices/code-comments', 'testing/e2e-testing', 'compliance/data-protection-fr'].map(n => [n, { files: [`/cards/${n}.md`] }]),
+  )
+  const backend = capabilitiesFor({ 'composer.json': '{"require":{"symfony/framework-bundle":"6.4.*"}}', 'compose.yaml': 'services:\n  db:\n    image: mysql:8' }, 'lead-backend', index)
+  expect(backend.sort()).toEqual(['/cards/databases/mysql.md', '/cards/frameworks/symfony.md', '/cards/infrastructure/docker.md', '/cards/languages/php.md', '/cards/practices/code-comments.md', '/cards/security/owasp.md'])
+  const front = capabilitiesFor({ 'package.json': '{"dependencies":{"nuxt":"4"},"devDependencies":{"typescript":"5","@playwright/test":"1"}}' }, 'lead-frontend', index)
+  expect(front).toContain('/cards/frameworks/vue.md')
+  expect(front).toContain('/cards/languages/typescript.md')
+  expect(front).toContain('/cards/testing/e2e-testing.md')
+  expect(front).not.toContain('/cards/languages/php.md')
+  expect(capabilitiesFor({}, 'compliance-officer', index)).toContain('/cards/compliance/data-protection-fr.md')
+  expect(capabilitiesFor({}, 'lead-backend', {})).toEqual([])
+})
+
+test('a task may follow a workflow its workspace offers; the reviewer\'s is never offered, an unknown one is dropped', async ($, on) => {
+  let reply: unknown = { status: 'ready', role: 'lead-backend', workflow: 'engineering/feature-development', title: 'Decks', brief: 'b' }
+  const { launched, asked } = world(on, JSON.stringify(SIZING), e => (e.system?.includes('Prompt Manager') ? JSON.stringify(reply) : JSON.stringify(SIZING)))
+  const flows = { index: { 'engineering/feature-development': { title: 'Workflow: Developing a new feature', files: ['/wf/feature-development.md'] }, 'engineering/code-review': { title: 'Review', files: ['/wf/code-review.md'] } } }
+  serve([{ path: '', roles: { list: { 'lead-backend': 'engineering' } }, workflows: flows }, ...WORKSPACES])
+  try {
+    await orch($, 'prompt mtg add decks')
+    expect(asked[0]?.prompt).toContain('Workflows: engineering/feature-development (Workflow: Developing a new feature)')
+    expect(asked[0]?.prompt).not.toContain('engineering/code-review')
+    expect(launched[0]?.prompt).toContain('- Follow the workflow engineering/feature-development for your part (/wf/feature-development.md)')
+    reply = { status: 'ready', workflow: 'made/up', title: 'X', brief: 'x' }
+    await orch($, 'prompt mtg other thing')
+    expect((await orch($, 'drop 1')).text).toContain('dropped')
+    expect(launched.at(-1)?.prompt).not.toContain('Follow the workflow')
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('the queue outlives its session: a new orchestrator takes over a gone one\'s open tasks', async ($, on) => {
+  const { files, sent } = world(on)
+  on('session.id', () => ({ value: 'new-session' }) as never)
+  const task = (id: number, state: string, worker: string, reviewer = '') =>
+    ({ id, repo: 'acme/core/acme-backend', role: 'lead-backend', text: `task ${id}`, state, round: 1, worker, reviewer, base: 'abc', report: '', branchFrom: 'main', sizing: SIZING, reviews: [], updatedAt: 0 }) as unknown as Task
+  const saved = {
+    owner: 'orch-old',
+    sessionId: 'old-session',
+    savedAt: 0,
+    tasks: [task(1, 'working', 'app-71'), task(2, 'reviewing', 'w2', 'orch-review-2-r1'), task(3, 'approved', 'w3')],
+    workers: [{ name: 'app-71', bgId: '1', repo: 'acme/core/acme-backend', role: 'lead-backend', model: 'opus', effort: 'high', task: 1 }],
+  }
+  files.set('/.claude/orchestra/queues/old-session.json', JSON.stringify(saved))
+  on('fs.list', () => ({ value: [{ name: 'old-session.json', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }) as never)
+  const ran = await orch($, '')
+  expect(ran.text).toContain('Took over the queue of orch-old, which is gone: 2 open task(s).')
+  // The live worker reports here now; the task whose reviewer is gone waits for the person.
+  expect(sent.find(m => m.to === 'app-71')?.text).toContain('The orchestrator of task #1 is now "app-22" (it was "orch-old")')
+  expect(ran.text).toContain('#2: its session is gone: /orch retry 2 hands it to a fresh one.')
+  const ui = await pane($)
+  expect(await stateOf(ui, 1)).toBe('● working')
+  expect(await stateOf(ui, 2)).toBe('⏸ blocked')
+  // The old file is emptied, so no other session takes the same queue again; this one keeps its own.
+  expect(JSON.parse(files.get('/.claude/orchestra/queues/old-session.json') ?? '{}').tasks).toEqual([])
+  expect(JSON.parse(files.get('/.claude/orchestra/queues/new-session.json') ?? '{}').tasks).toHaveLength(3)
+})
+
+test('the usage reading carries each session\'s last action', () => {
+  const u = toUsage({ model: 'claude-opus-5', context: 1, turns: 1, input: 1, output: 1, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, last: 'Bash: run the tests', lastAt: '2026-10-06T11:56:20.218Z' }, 0)
+  expect(u).toMatchObject({ last: 'Bash: run the tests', lastAt: Date.parse('2026-10-06T11:56:20.218Z'), isPriced: true })
+})
+
+test('a queue whose orchestrator still runs is not taken over', async ($, on) => {
+  const { files } = world(on)
+  on('session.id', () => ({ value: 'new-session' }) as never)
+  const saved = {
+    owner: 'app-71',
+    sessionId: 'other-session',
+    savedAt: 0,
+    tasks: [{ id: 1, repo: 'mtg', role: 'developer', text: 'x', state: 'working', round: 1, worker: 'w', reviewer: '', base: '', report: '', branchFrom: 'main', sizing: SIZING, reviews: [], updatedAt: 0 }],
+    workers: [],
+  }
+  files.set('/.claude/orchestra/queues/other-session.json', JSON.stringify(saved))
+  on('fs.list', () => ({ value: [{ name: 'other-session.json', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }) as never)
+  expect((await orch($, '')).text).not.toContain('Took over')
+  expect(JSON.parse(files.get('/.claude/orchestra/queues/other-session.json') ?? '{}').tasks).toHaveLength(1)
+})
+
+test('a check sees the commit the task started from as {base}', async ($, on) => {
+  const { commands, clock } = world(on)
+  serve([{ ...(WORKSPACES[0] as Workspace), checks: { '*': ['git diff --name-only {base}'] } }])
+  try {
+    await orch($, 'task acme/core/acme-backend fix the export')
+    await receive($, 'orch-lead-backend-acme-backend', 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/export')
+    await drain(clock)
+    expect(commands).toContainEqual(['sh', '-c', 'git diff --name-only abc123'])
+  } finally {
+    serve(WORKSPACES)
+  }
+})
+
+test('the workspace practices reach every worker and reviewer; an inner workspace with none of its own opts out', () => {
+  const texts = [{ file: '/claude-code/cortex/practices/engineering.md', text: '# Engineering practices\n\n| **Commits** | gitmoji |', semantic: 'base' }]
+  setWorkspaces([{ path: '', practices: { texts } }, { ...(WORKSPACES[0] as Workspace), practices: { docs: [], texts: [] } }])
+  try {
+    const worker = JSON.parse(workerAgent('developer', 'mtg'))['orch-developer'].prompt as string
+    expect(worker).toContain("Follow these conventions in everything you write and commit; a repo's own written conventions win over them.")
+    expect(worker).toContain('----- conventions: /claude-code/cortex/practices/engineering.md -----\n# Engineering practices')
+    expect(JSON.parse(reviewerAgent('mtg'))['orch-reviewer'].prompt).toContain('one not followed is a finding')
+    expect(JSON.parse(workerAgent('lead-backend', 'acme/core/acme-backend'))['orch-lead-backend'].prompt).not.toContain('Engineering practices')
+  } finally {
+    setWorkspaces(WORKSPACES)
+  }
 })

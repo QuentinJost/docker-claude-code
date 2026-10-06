@@ -43,6 +43,8 @@ import {
   reworkBrief,
   answerBrief,
   checksBrief,
+  capabilitiesFor,
+  STACK_MARKERS,
   followupText,
   taskDir,
   doneDigest,
@@ -54,7 +56,7 @@ import {
   workerBrief,
   workerName,
 } from './pipeline'
-import { ROOT, allWorkspaces, checkTimeoutMs, checksFor, describe, isKnownRole, isTarget, parseWorkspaces, setWorkspaces, targetNames, workspaceDir, workspaceErrors } from './workspace'
+import { ROOT, allWorkspaces, capabilityIndex, fill, checkTimeoutMs, checksFor, describe, isKnownRole, isTarget, workflowIndex, parseWorkspaces, setWorkspaces, targetNames, workspaceDir, workspaceErrors } from './workspace'
 
 const PANE = 'orchestra'
 const PANE_BACKGROUND = 'bashMessageBackgroundColor'
@@ -173,6 +175,82 @@ async function refresh($: EngineInterface) {
   await listSessions($)
   // Best effort: usage is shown when it can be read, and never stops the rest.
   await refreshUsage($).catch(() => undefined)
+  await saveQueue($).catch(() => undefined)
+}
+
+/** What a session's queue file holds: enough for another session to take the queue over. */
+type Saved = { owner: string; sessionId: string; savedAt: number; tasks: Task[]; workers: Worker[] }
+
+const isOpen = (task: Task): boolean => task.state !== 'approved' && task.state !== 'dropped'
+
+/** Where the queues are kept, one file per orchestrator session: the session's state dies with it. */
+async function queuesDir($: EngineInterface) {
+  const config =
+    (await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) ?? `${(await $.env.get('HOME').catch(() => undefined)) ?? ''}/.claude`
+  return `${config}/orchestra/queues`
+}
+
+/**
+ * Keeps this session's queue in a file, so that it outlives the session (a restart, an image
+ * rebuild). A session that never queued a task writes nothing.
+ */
+async function saveQueue($: EngineInterface) {
+  const list = await read($, tasks)
+  if (list.length === 0) {
+    return
+  }
+  const sessionId = await $.session.id()
+  const saved: Saved = { owner: await read($, self), sessionId, savedAt: await $.clock.now(), tasks: list, workers: await read($, workers) }
+  await $.fs.write(`${await queuesDir($)}/${sessionId}.json`, JSON.stringify(saved))
+}
+
+/**
+ * On the first /orch of a session with no queue of its own: takes over the open queue of an
+ * orchestrator session that is gone. Its live workers are told whom to report to now; a task
+ * whose session is gone waits for the person. What it says, or '' when there was nothing to take.
+ */
+async function adoptQueue($: EngineInterface): Promise<string> {
+  if ((await read($, tasks)).length > 0) {
+    return ''
+  }
+  const dir = await queuesDir($)
+  const mine = await $.session.id()
+  const live = await listSessions($)
+  if (live === null) {
+    return ''
+  }
+  const me = await read($, self)
+  for (const entry of await $.fs.list(dir).catch(() => [])) {
+    if (!entry.name.endsWith('.json') || entry.name === `${mine}.json`) {
+      continue
+    }
+    const saved = await $.fs
+      .read(`${dir}/${entry.name}`)
+      .then(text => JSON.parse(String(text)) as Saved)
+      .catch(() => null)
+    // Its owner still runs it, or nothing is left open there.
+    if (!saved || live.has(saved.owner) || !saved.tasks.some(isOpen)) {
+      continue
+    }
+    await update($, tasks, () => saved.tasks)
+    await update($, workers, () => saved.workers.filter(w => live.has(w.name)))
+    const lines: string[] = []
+    for (const task of saved.tasks.filter(t => ['working', 'checking', 'reviewing'].includes(t.state))) {
+      const holder = task.state === 'reviewing' ? task.reviewer : task.worker
+      if (live.has(holder)) {
+        await send($, holder, `[ORCH ${me}] The orchestrator of task #${task.id} is now "${me}" (it was "${saved.owner}"): send your report or verdict to "${me}" with SendMessage, in the same format.`, true)
+        lines.push(`#${task.id}: ${holder} is still at it and now reports here.`)
+      } else {
+        await patchTask($, task.id, { state: 'blocked', report: blockedReport(`the orchestrator restarted and ${holder || 'its session'} is gone`) })
+        lines.push(`#${task.id}: its session is gone: /orch retry ${task.id} hands it to a fresh one.`)
+      }
+    }
+    await $.fs.write(`${dir}/${entry.name}`, JSON.stringify({ ...saved, tasks: [], adoptedBy: me })).catch(() => undefined)
+    await saveQueue($)
+    await log($, { direction: 'notice', peer: 'queue', text: `taken over from ${saved.owner}: ${saved.tasks.filter(isOpen).length} open task(s)` })
+    return [`Took over the queue of ${saved.owner}, which is gone: ${saved.tasks.filter(isOpen).length} open task(s).`, ...lines].join('\n')
+  }
+  return ''
 }
 
 /** Where this machine's transcripts of sessions started in ROOT live. */
@@ -399,7 +477,7 @@ async function charge($: EngineInterface, id: number, cost: number) {
 }
 
 /** What a typed task holds: `<repo> <description> [@role] [model:… effort:…] [after:#n] [from:<branch>]`. */
-type Input = { repo: string; role: string; text: string; work: Partial<Setting>; after: number[]; from: string; spent?: number }
+type Input = { repo: string; role: string; text: string; work: Partial<Setting>; after: number[]; from: string; spent?: number; workflow?: string }
 
 const parseInput = (input: string): Input | null => {
   const parsed = parseTask(input)
@@ -473,6 +551,8 @@ async function queueTask($: EngineInterface, input: Input): Promise<{ id: number
     reviews: [],
     updatedAt: at,
     callCost: spent + (input.spent ?? 0),
+    // Only a workflow the repo's workspace offers: a name the model made up leads nowhere.
+    ...(input.workflow && workflowIndex(repo)[input.workflow] ? { workflow: input.workflow } : {}),
     ...(after.length > 0 ? { after } : {}),
     ...(from ? { from } : {}),
   }
@@ -539,7 +619,7 @@ async function upgradeTask($: EngineInterface, input: string): Promise<string> {
   }
   const text = `${upgrade.title}\n\n${upgrade.brief}`
   const role = pick(upgrade.role)
-  const queued = await queueTask($, { ...parsed, role, text, spent })
+  const queued = await queueTask($, { ...parsed, role, text, spent, ...(upgrade.workflow ? { workflow: upgrade.workflow } : {}) })
   if ('error' in queued) {
     return `Not queued: ${queued.error}.`
   }
@@ -638,10 +718,10 @@ async function queueRouted(
 ): Promise<string> {
   const answers: string[] = []
   const ids: (number | undefined)[] = []
-  for (const [index, { repo, title, brief, after, role }] of list.entries()) {
+  for (const [index, { repo, title, brief, after, role, workflow }] of list.entries()) {
     const text = `${title}\n\n${brief}`
     const waits = [...new Set([...overrides.after, ...after.map(i => ids[i]).filter((n): n is number => n !== undefined)])]
-    const queued = await queueTask($, { repo, role, text, work: overrides.work, after: waits, from: '', spent: spent / list.length })
+    const queued = await queueTask($, { repo, role, text, work: overrides.work, after: waits, from: '', spent: spent / list.length, ...(workflow ? { workflow } : {}) })
     if ('error' in queued) {
       answers.push(`Not queued in ${repo}: ${queued.error}.`)
       ids[index] = undefined
@@ -693,6 +773,22 @@ async function ensureRepo($: EngineInterface, repo: string): Promise<string | { 
     isNew = true
   }
   return { isNew }
+}
+
+/** The capability cards of a task's repo stack, read from its marker files; none for a non-git target or a workspace without cards. */
+async function stackCapabilities($: EngineInterface, task: Task): Promise<string[]> {
+  const index = capabilityIndex(task.repo)
+  if (isTarget(task.repo) || Object.keys(index).length === 0) {
+    return []
+  }
+  const files: Partial<Record<(typeof STACK_MARKERS)[number], string>> = {}
+  for (const marker of STACK_MARKERS) {
+    const text = await $.fs.read(`${ROOT}/${task.repo}/${marker}`).catch(() => null)
+    if (typeof text === 'string') {
+      files[marker] = text.slice(0, 200_000)
+    }
+  }
+  return capabilitiesFor(files, task.role, index)
 }
 
 /** A local clone of a task's repo for it alone, on its start branch; its path, or null. */
@@ -784,9 +880,19 @@ async function dispatch($: EngineInterface) {
       continue
     }
     const prior = priorNote(task, all)
-    const started: Task = { ...task, state: 'working', branchFrom, base, ...(dir ? { dir } : {}), ...(prior ? { prior } : {}), ...(isNewApp ? { isNewApp } : {}) }
+    const capabilities = await stackCapabilities($, task)
+    const started: Task = {
+      ...task,
+      state: 'working',
+      branchFrom,
+      base,
+      ...(dir ? { dir } : {}),
+      ...(prior ? { prior } : {}),
+      ...(isNewApp ? { isNewApp } : {}),
+      ...(capabilities.length ? { capabilities } : {}),
+    }
     const brief = workerBrief(me, started)
-    await patchTask($, task.id, { ...(prior ? { prior } : {}), ...(dir ? { dir } : {}), ...(isNewApp ? { isNewApp } : {}) })
+    await patchTask($, task.id, { ...(prior ? { prior } : {}), ...(dir ? { dir } : {}), ...(isNewApp ? { isNewApp } : {}), ...(capabilities.length ? { capabilities } : {}) })
 
     if (worker) {
       await patchTask($, task.id, { state: 'working', branchFrom, base: started.base, worker: worker.name })
@@ -898,7 +1004,8 @@ async function runChecks($: EngineInterface, task: Task, checks: string[]): Prom
     }
   }
   for (const command of checks) {
-    const ran = await exec($, ['sh', '-c', command], dir, checkTimeoutMs(task.repo))
+    // {base}: the commit the task branch started from, so a check can look at the task's own changes.
+    const ran = await exec($, ['sh', '-c', fill(command, { base: task.base || 'HEAD' })], dir, checkTimeoutMs(task.repo))
     if (ran.exitCode !== 0) {
       const output = `${ran.stdout}\n${ran.stderr}`.trim().split('\n').slice(-CHECK_OUTPUT_LINES).join('\n').slice(-6000)
       return { failed: command, output: output || `exit code ${ran.exitCode}, no output` }
@@ -1334,8 +1441,10 @@ export const register: Register = on => {
   on('command.run', { command: 'orch' }, async ($, e) => {
     await loadWorkspaces($)
     await refresh($)
+    const adopted = await serial(() => adoptQueue($)).catch(() => '')
     const before = added
-    let text = `${await runCommand($, e.args)}${configWarning()}`
+    let text = `${adopted ? `${adopted}\n\n` : ''}${await runCommand($, e.args)}${configWarning()}`
+    await saveQueue($).catch(() => undefined)
     if (added > before && !(await read($, remoteSeen)) && !(await read($, reminded))) {
       await update($, reminded, () => true)
       await log($, { direction: 'notice', peer: 'remote', text: 'reminder given: /remote-control to get the alerts on the phone' })
@@ -1361,6 +1470,9 @@ export const register: Register = on => {
       return next(e)
     }
     const { isOwn, digest } = await serial(() => onReceive($, e.text))
+    if (isOwn) {
+      await saveQueue($).catch(() => undefined)
+    }
     if (digest) {
       return next({ ...e, text: digest })
     }
@@ -1378,6 +1490,9 @@ export const register: Register = on => {
       return next(e)
     }
     const { isOwn, digest } = await serial(() => onReceive($, e.text))
+    if (isOwn) {
+      await saveQueue($).catch(() => undefined)
+    }
     if (digest) {
       return next({ ...e, text: digest })
     }
@@ -1640,6 +1755,16 @@ export const register: Register = on => {
         </Box>
       )
     })
+    // What each busy session did last, under its row: the pane shows the work moving, not only its state.
+    const lastActions = workerList
+      .filter(w => w.task !== null && used[w.name]?.last)
+      .map(w => (
+        <Box key={`last-${w.name}`} paddingLeft={2}>
+          <Text dimColor wrap="truncate-end">
+            ↳ {w.name}: {used[w.name]?.last} · {ago(used[w.name]?.lastAt ?? now, now)} ago
+          </Text>
+        </Box>
+      ))
 
     const feedRoom = Math.max(3, rows - shown.length * 2 - workerList.length - 30)
     const activity = entries.slice(-feedRoom).map(entry => (
@@ -1703,6 +1828,7 @@ export const register: Register = on => {
           {sessionColumns}
           {orchestratorRow}
           {workerRows.length === 0 ? <Text dimColor>No worker launched yet.</Text> : workerRows}
+          {lastActions}
           {retired.length > 0 && (
             <Text dimColor>
               + {retired.length} retired session{retired.length === 1 ? '' : 's'} ·{' '}

@@ -8,6 +8,9 @@ import {
   knownRoles,
   roleCard,
   characterFor,
+  reviewTexts,
+  practiceTexts,
+  workflowIndex,
   reviewerCharacter,
   roleSummaries,
   isLightRole,
@@ -195,7 +198,8 @@ export const UPGRADE_SYSTEM = [
   'Keep every fact, identifier and ticket key of the request verbatim; never invent requirements, file names or data the request does not give. Where the request leaves a routine choice open, say which default the developer should take.',
   'A request whose intent cannot be told, or that contradicts itself, is not forwarded: ask instead, with the fewest questions that would settle it.',
   `A request that spans distinct domains of one repo (an API and the UI that uses it, a schema migration and the code on it, the code and its end-to-end tests) is split into one task per domain, each for the role of that domain among the roles listed, so that each is done by a specialist; at most ${4} tasks. Tasks run one after the other in a repo: give a task "after", the 0-based positions of the earlier tasks of your list it builds on (the UI waits for the API it calls). Do not split a request that one developer does best in one go (a small change, a single domain).`,
-  'Reply with JSON only, one of: {"status":"ready","title":"one line, 100 characters at most, the ticket key first when there is one","role":"a listed role, or omit it","brief":"the brief, markdown, newlines as \\n"} for one task; {"status":"ready","tasks":[{"role":"a listed role","after":[0],"title":"…","brief":"…"}]} for a split; or {"status":"unclear","questions":["…"]}.',
+  'When a listed workflow fits the work (a feature, a support case, frontend tests, a regulatory deliverable…), name it in "workflow": its developer follows its steps for its part, and a split follows the workflow\'s order of roles. Name none when nothing fits.',
+  'Reply with JSON only, one of: {"status":"ready","title":"one line, 100 characters at most, the ticket key first when there is one","role":"a listed role, or omit it","workflow":"a listed workflow, or omit it","brief":"the brief, markdown, newlines as \\n"} for one task; {"status":"ready","tasks":[{"role":"a listed role","workflow":"…","after":[0],"title":"…","brief":"…"}]} for a split; or {"status":"unclear","questions":["…"]}.',
 ].join('\n')
 
 /** How a repo reads in prompts: its ticket tracker, or that it has none. */
@@ -211,6 +215,7 @@ export const upgradePrompt = (repo: string, role: string, text: string): string 
       : `Repo: ${ROOT}/${repo}${ticketNote(repo, text)}`,
     `Developer role: ${role} (its role card, if any, is loaded in its session)`,
     ...(Object.keys(knownRoles(repo)).length ? [`Roles for a split: ${roleSummaries(repo).join(', ')}`] : []),
+    ...(Object.keys(workflowIndex(repo)).length ? [`Workflows: ${Object.entries(workflowIndex(repo)).map(([n, w]) => `${n} (${w.title})`).join(', ')}`] : []),
     `Request:\n${text}`,
   ].join('\n')
 
@@ -228,7 +233,7 @@ export const ROUTE_SYSTEM = [
   'Pick the repo whose code the change lives in. Prefer a main checkout over a ticket worktree (a folder named after a ticket key) unless the request names that ticket; never pick a throwaway sandbox unless the request names it; never pick a repo marked as migrated or deprecated.',
   `A request that needs changes in several repos becomes one task per repo, each with its own brief (at most ${MAX_ROUTED} tasks in all); say in each brief what the other side does. Within one repo, split by domain as above, several tasks on the same repo. Tasks run in parallel unless one needs another's result: then give it "after", the 0-based positions of the earlier tasks of your list it waits for (the frontend that consumes a new API field waits for the backend task).`,
   `Ticket rules apply only to a request that names a ticket key: never invent, search or ask for a key. A request you cannot place is not forwarded: ask instead.`,
-  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","role":"a listed role, or omit it","after":[0],"title":"one line, 100 characters at most, the ticket key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
+  'Reply with JSON only, either {"status":"ready","tasks":[{"repo":"path as listed","role":"a listed role, or omit it","workflow":"a listed workflow, or omit it","after":[0],"title":"one line, 100 characters at most, the ticket key first when there is one","brief":"the brief, markdown, newlines as \\n"}]} or {"status":"unclear","questions":["…"]}.',
 ].join('\n')
 
 export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: string | null, text: string): string =>
@@ -241,11 +246,12 @@ export const routePrompt = (repos: readonly RepoInfo[], overview: string, role: 
     ...(overview ? ['', 'Workspace overview:', overview] : []),
     '',
     ...(Object.keys(knownRoles(null)).length ? ['', `Roles: ${roleSummaries(null).join(', ')}`] : []),
+    ...(Object.keys(workflowIndex(null)).length ? [`Workflows: ${Object.entries(workflowIndex(null)).map(([n, w]) => `${n} (${w.title})`).join(', ')}`] : []),
     ...(role ? [`Developer role, named by the person: ${role}`] : []),
     `Request:\n${text}`,
   ].join('\n')
 
-export type RoutedTask = { repo: string; title: string; brief: string; after: number[]; role?: string }
+export type RoutedTask = { repo: string; title: string; brief: string; after: number[]; role?: string; workflow?: string }
 
 export type Routed = { tasks: RoutedTask[] } | { questions: string[] }
 
@@ -260,7 +266,7 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
     if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
       const known = new Set([...targetNames(), ...repos.map(r => r.repo)])
       const tasks = parsed.tasks
-        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown; after?: unknown; role?: unknown })
+        .map(t => t as { repo?: unknown; title?: unknown; brief?: unknown; after?: unknown; role?: unknown; workflow?: unknown })
         .filter(t => typeof t.repo === 'string' && known.has(t.repo) && typeof t.brief === 'string' && t.brief.trim() !== '')
         .map((t, index) => {
           const brief = String(t.brief).trim()
@@ -272,6 +278,7 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
             brief,
             after,
             ...(typeof t.role === 'string' && t.role ? { role: t.role } : {}),
+            ...(typeof t.workflow === 'string' && t.workflow ? { workflow: t.workflow } : {}),
           }
         })
         .slice(0, MAX_ROUTED)
@@ -287,7 +294,7 @@ export const parseRouting = (reply: string, repos: readonly RepoInfo[]): Routed 
   }
 }
 
-export type Upgrade = { title: string; brief: string; role?: string } | { tasks: RoutedTask[] } | { questions: string[] }
+export type Upgrade = { title: string; brief: string; role?: string; workflow?: string } | { tasks: RoutedTask[] } | { questions: string[] }
 
 /** Reads the upgrade JSON the orchestrator's model replied, or null when it is not one. */
 /** Reads the upgrade JSON: one brief, a split of the request by domain into tasks on `repo`, or questions. */
@@ -297,7 +304,7 @@ export const parseUpgrade = (reply: string, repo = ''): Upgrade | null => {
     return null
   }
   try {
-    const parsed = JSON.parse(json) as { status?: string; title?: string; brief?: string; role?: unknown; tasks?: unknown; questions?: unknown }
+    const parsed = JSON.parse(json) as { status?: string; title?: string; brief?: string; role?: unknown; workflow?: unknown; tasks?: unknown; questions?: unknown }
     if (parsed.status === 'ready' && Array.isArray(parsed.tasks)) {
       // The same shape as a routing, every task on the repo the person named.
       const tasks = (parsed.tasks as Record<string, unknown>[]).map(t => ({ ...t, repo }))
@@ -309,6 +316,7 @@ export const parseUpgrade = (reply: string, repo = ''): Upgrade | null => {
         title: firstLine(parsed.title.trim()) || firstLine(parsed.brief.trim()),
         brief: parsed.brief.trim(),
         ...(typeof parsed.role === 'string' && parsed.role ? { role: parsed.role } : {}),
+        ...(typeof parsed.workflow === 'string' && parsed.workflow ? { workflow: parsed.workflow } : {}),
       }
     }
     if (parsed.status === 'unclear' && Array.isArray(parsed.questions)) {
@@ -341,6 +349,35 @@ const personalityLines = (played: { theme: string; character: { name: string; ca
       ]
     : []
 
+/**
+ * The reviewer's rules as its workspace gives them: the base, then each overlay, whole. This
+ * review is local: what the rules say of publishing (GitHub events, labels, comments) is left out.
+ */
+const reviewDocLines = (repo: string): string[] => {
+  const texts = repo ? reviewTexts(repo) : []
+  return texts.length
+    ? [
+        'Your review rules follow: the base, then the workspace overlay, which wins where they differ (a replacement overlay rewrites the parts it names; the rest of the base stands). This review is local: you publish nothing, so the steps about GitHub events, labels and comments do not apply; your verdict goes to the orchestrator, in the brief\'s format, with the rules\' severities and vocabulary.',
+        ...texts.flatMap(t => [`----- ${t.semantic === 'base' ? 'base rules' : `overlay (${t.semantic})`}: ${t.file} -----`, t.text]),
+        '----- end of review rules -----',
+      ]
+    : []
+}
+
+/** The workspace's conventions, whole: what the worker follows and the reviewer holds the work to. */
+const practiceLines = (repo: string, isReviewer: boolean): string[] => {
+  const texts = repo ? practiceTexts(repo) : []
+  return texts.length
+    ? [
+        isReviewer
+          ? 'The conventions the work must follow are below: one not followed is a finding, at the severity the review rules give a written convention.'
+          : 'Follow these conventions in everything you write and commit; a repo\'s own written conventions win over them.',
+        ...texts.flatMap(t => [`----- conventions: ${t.file} -----`, t.text]),
+        '----- end of conventions -----',
+      ]
+    : []
+}
+
 /** The workspace a task's repo or target belongs to. */
 const wsOf = (repo: string) => workspaceOf(repo) ?? targetOf(repo)?.ws ?? null
 
@@ -357,9 +394,18 @@ export const workerAgent = (role: string, repo = ''): string => {
           '----- role card -----',
           card.prompt,
           '----- end of role card -----',
+          ...(card.overlay
+            ? [
+                `The workspace's overlay of that card follows (${card.semantic === 'replacement' ? 'it replaces the parts of the card it rewrites' : 'it adds to the card'}; where they differ, the overlay wins).`,
+                '----- workspace overlay -----',
+                card.overlay,
+                '----- end of overlay -----',
+              ]
+            : []),
         ]
       : []),
     ...(ws?.roles?.worker ?? []).map(line => fill(line, values)),
+    ...practiceLines(repo, false),
     ...personalityLines(repo ? characterFor(role, repo) : null),
     'Tasks arrive as cross-session messages from the orchestrator. One task at a time; stay inside the repo the brief names.',
     'Always finish by replying with SendMessage to the orchestrator, in the exact report format the brief asks for.',
@@ -375,6 +421,8 @@ export const reviewerAgent = (repo = ''): string => {
     'You are the code reviewer of an orchestrator session. You review; you never edit, commit, push, or comment on GitHub.',
     ...(ws?.roles?.reviewer ?? []).map(line => fill(line, { workspace: workspaceDir(ws as NonNullable<typeof ws>) })),
     'Review against the task\'s acceptance criteria and the repo\'s own conventions. Verify every finding against the code before reporting it. Approve only when no 🔴 blocking and no 🟠 major finding remains.',
+    ...reviewDocLines(repo),
+    ...practiceLines(repo, true),
     ...personalityLines(repo ? reviewerCharacter(repo) : null),
     'Always finish by replying with SendMessage to the orchestrator, in the exact verdict format the brief asks for.',
   ].join('\n')
@@ -427,6 +475,12 @@ export const workerBrief = (self: string, task: Task): string =>
       : '- Commit locally with the project\'s git identity and subject format, without any ticket key; never push.',
     '- Run the relevant tests before reporting.',
     ...(integrationFor(task.repo) ? [`- Run the integration suite too, from the repo: ${integrationFor(task.repo)}. A task is not done while it fails; report its result in TESTS.`] : []),
+    ...(task.capabilities?.length
+      ? [`- Capability cards for this repo's stack (the practices of its language, framework, database…): read those that bear on your change: ${task.capabilities.join(', ')}.`]
+      : []),
+    ...(task.workflow && workflowIndex(task.repo)[task.workflow]
+      ? [`- Follow the workflow ${task.workflow} for your part (${workflowIndex(task.repo)[task.workflow]?.files.join(' then the overlay ')}): read it first; the steps that are not yours (another role, a review) are done by the orchestrator, not by you.`]
+      : []),
     ...(task.isNewApp && newAppRules(task.repo).length ? ['- This is a new app. Every new app must meet these rules, as part of this task:', ...newAppRules(task.repo).map(line => `  - ${line}`)] : []),
     '',
     `When finished, reply via SendMessage to "${self}" with:`,
@@ -763,6 +817,39 @@ export const plan = (tasks: Task[], workers: Worker[]): { task: Task; worker: Wo
   }
 
   return moves
+}
+
+/** The files a repo's stack is told from, at its root. */
+export const STACK_MARKERS = ['composer.json', 'package.json', 'go.mod', 'Dockerfile', 'compose.yaml', 'compose.yml', 'docker-compose.yml', 'tsconfig.json'] as const
+
+const COMPLIANCE_ROLES = ['compliance-officer', 'regulatory-compliance-writer']
+
+/**
+ * The capability cards a task's worker is pointed at: those of the repo's stack, as its marker
+ * files tell it (`files`: marker → content, absent ones left out), among the cards its workspace
+ * offers, plus the ones cortex loads for every role (OWASP, code comments). Paths, base first.
+ */
+export const capabilitiesFor = (files: Partial<Record<(typeof STACK_MARKERS)[number], string>>, role: string, index: Record<string, { files: string[] }>): string[] => {
+  const composer = files['composer.json'] ?? ''
+  const pkg = files['package.json'] ?? ''
+  const compose = [files['compose.yaml'], files['compose.yml'], files['docker-compose.yml']].join('\n')
+  const wanted = new Set(['security/owasp', 'practices/code-comments'])
+  const want = (name: string, when: boolean) => when && wanted.add(name)
+  want('languages/php', files['composer.json'] !== undefined)
+  want('frameworks/symfony', /"symfony\//.test(composer))
+  want('languages/typescript', files['tsconfig.json'] !== undefined || /"typescript"/.test(pkg))
+  want('frameworks/vue', /"(vue|nuxt)"/.test(pkg))
+  want('testing/e2e-testing', /"@playwright\/test"|"playwright"|"cypress"/.test(pkg))
+  want('testing/component-testing', /"@vue\/test-utils"|"vitest"|"@testing-library\//.test(pkg))
+  want('infrastructure/docker', files['Dockerfile'] !== undefined || compose.trim() !== '')
+  want('databases/mysql', /mysql|mariadb/i.test(compose))
+  want('databases/postgresql', /postgres/i.test(compose))
+  want('databases/mongodb', /mongo/i.test(compose))
+  want('search/opensearch', /opensearch/i.test(compose + composer + pkg))
+  if (COMPLIANCE_ROLES.includes(role)) {
+    Object.keys(index).filter(name => name.startsWith('compliance/')).forEach(name => wanted.add(name))
+  }
+  return [...wanted].filter(name => index[name]).flatMap(name => index[name]?.files ?? [])
 }
 
 /** A session name for a new worker, unique among the ones already used. */

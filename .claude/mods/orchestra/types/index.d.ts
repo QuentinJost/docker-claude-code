@@ -46,6 +46,10 @@ export type Task = {
   checks?: string
   /** How many times the orchestrator's own checks sent the task back before a review. */
   checkFixes?: number
+  /** The capability cards of the repo's stack the worker is pointed at (paths). */
+  capabilities?: string[]
+  /** The workflow the task follows (a name of its workspace's workflows index), if any. */
+  workflow?: string
   /** The orchestrator made the task's folder a repo (git init or a first commit): a new app, with its rules. */
   isNewApp?: boolean
   /** What the orchestrator's own model calls for this task cost (sizing, brief, routing), in $. */
@@ -93,6 +97,9 @@ export type WorkerUsage = {
   turns: number
   cost: number
   isPriced: boolean
+  /** The session's last tool call, in one line, and when (ms). */
+  last?: string
+  lastAt?: number
   /** The task the session held when last read, and its role (`reviewer`, `orchestrator`, a workspace role). */
   task: number | null
   role: string

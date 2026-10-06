@@ -10,6 +10,9 @@ export type TranscriptTotals = {
   cacheRead: number
   cacheWrite5m: number
   cacheWrite1h: number
+  /** The session's last tool call, in one line, and when (ISO). */
+  last?: string
+  lastAt?: string
   /** The session's subagents, by model: their own transcripts, summed. */
   subagents?: TranscriptTotals[]
 }
@@ -84,6 +87,7 @@ export const toUsage = (totals: TranscriptTotals, at: number): Omit<WorkerUsage,
     cost,
     // A session that has not answered yet costs nothing, whatever its model.
     isPriced: (price !== undefined || totals.turns === 0) && subs.every(sub => priceOf(sub.model) !== undefined),
+    ...(totals.last ? { last: totals.last, lastAt: Date.parse(totals.lastAt ?? '') || 0 } : {}),
     at,
   }
 }
