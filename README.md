@@ -13,6 +13,8 @@ typical session by roughly 80%.
 - **rtk** — single Rust binary, installed system-wide to `/usr/local/bin`
 - **Runtimes** — Python 3, PHP, Go, Node (from the `node:slim` base image)
 - **Docker CLI** — talks to the host daemon via the mounted socket
+- **Cortex** — the [`cortex`](https://github.com/adorey/cortex) command and its
+  agent spec, pinned by `CORTEX_VERSION` (see below)
 - Runs as the non-root `www-data` user (UID/GID remapped to 1000)
 
 Mount layout inside the container:
@@ -187,6 +189,14 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
 - **rtk binary location** — installed to `/usr/local/bin/rtk`
   (world-executable) so the non-root `www-data` user can run it. The
   installer's default `~/.local/bin` location isn't reachable by that user.
+- **Cortex** — the `cortex` binary lives in `/opt/cortex/bin` (on `PATH`) and
+  the spec of the pinned version in the read-only store,
+  `/opt/cortex/versions/<CORTEX_VERSION>`, with Cortex's `LICENSE` and `NOTICE`
+  in `/opt/cortex`. The orchestra mod builds each worker's agent from the role
+  cards there (`roles.from` in `~/dev/orchestra.json`). To upgrade: bump
+  `CORTEX_VERSION` in the Dockerfile, rebuild (`docker compose up -d --build`,
+  which restarts the container and every session in it), then bump the version
+  in that `roles.from` path.
 - **UID/GID 1000** — `www-data` is remapped to 1000:1000 so files created in
   the mounted project keep sane ownership on a typical Linux host. If your
   host user isn't 1000, adjust the `usermod`/`groupmod` lines in the
@@ -196,3 +206,4 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
 
 - Claude Code docs: https://docs.claude.com/en/docs/claude-code/overview
 - rtk: https://github.com/rtk-ai/rtk
+- Cortex: https://github.com/adorey/cortex

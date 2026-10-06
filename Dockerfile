@@ -61,6 +61,26 @@ RUN pipx install "graphifyy[mcp]" \
  && graphify --version
 
 # ---------------------------------------------------------------------------
+# Cortex (github.com/adorey/cortex, Apache-2.0) — the AI agent spec the orchestra
+# mod builds its role agents from. The binary is pinned; its install script checks
+# the release's SHA256SUMS. `cortex sync` in a throwaway project puts that version's
+# spec in the read-only store, $CORTEX_HOME/versions/X.Y.Z. LICENSE and NOTICE go
+# beside it: the store holds the spec only. To upgrade, bump CORTEX_VERSION and
+# the version in the roles path of the orchestra's orchestra.json.
+# ---------------------------------------------------------------------------
+ARG CORTEX_VERSION=1.1.1
+ENV CORTEX_HOME=/opt/cortex \
+    PATH=/opt/cortex/bin:$PATH
+RUN curl -fsSL "https://raw.githubusercontent.com/adorey/cortex/${CORTEX_VERSION}/install.sh" | sh -s -- "${CORTEX_VERSION}" --name cortex \
+ && for f in LICENSE NOTICE; do curl -fsSL -o "$CORTEX_HOME/$f" "https://raw.githubusercontent.com/adorey/cortex/${CORTEX_VERSION}/$f"; done \
+ && tmp=$(mktemp -d) \
+ && printf 'version = "%s"\ntheme = "none"\n' "$CORTEX_VERSION" > "$tmp/cortex.toml" \
+ && (cd "$tmp" && cortex sync) \
+ && rm -rf "$tmp" \
+ && test -f "$CORTEX_HOME/versions/$CORTEX_VERSION/agents/roles/engineering/lead-frontend.md" \
+ && cortex --version
+
+# ---------------------------------------------------------------------------
 # Align www-data to uid/gid 1000 (-o because uid 1000 is the existing node user)
 # and give it docker access.
 # ---------------------------------------------------------------------------
