@@ -207,6 +207,32 @@ alias claude='docker compose -f ~/dev/claude-code/compose.yaml up -d && docker c
   host user isn't 1000, adjust the `usermod`/`groupmod` lines in the
   Dockerfile.
 
+## Coucou (optional)
+
+[Coucou](https://github.com/Louis-CFM/coucou) shows the Claude Code sessions,
+and their permission requests, at the top of the host's desktop. The sessions
+run in this container, so they reach Coucou through a private directory of the
+host's user, mounted at `/run/coucou`. It needs a Coucou build that serves
+`COUCOU_EXTRA_SOCKET_DIRS` (branch `feat/extra-socket-dirs` of `~/dev/coucou`,
+until the project ships it).
+
+On the host, once:
+
+```bash
+sudo dnf install ./coucou-*.x86_64.rpm            # the build with COUCOU_EXTRA_SOCKET_DIRS
+mkdir -p ~/.local/share/coucou/relay && chmod 700 ~/.local/share/coucou/relay
+mkdir -p ~/.config/environment.d
+echo 'COUCOU_EXTRA_SOCKET_DIRS=${HOME}/.local/share/coucou/relay' > ~/.config/environment.d/coucou.conf
+# log out and in (or reboot), start Coucou once: it installs ~/.local/share/coucou/bin/coucou-hook
+```
+
+Do not use Coucou's "Install hooks": it edits the host's `~/.claude`, which the
+container's sessions do not read. Then add
+`COMPOSE_FILE=compose.yaml:compose.coucou.yaml` to `.env` and restart the
+container (`docker compose up -d`). The hooks of `.claude/settings.json` run
+`/opt/coucou/bin/coucou-hook` with `XDG_RUNTIME_DIR=/run/coucou`; when Coucou is
+closed, they exit at once.
+
 ## References
 
 - Claude Code docs: https://docs.claude.com/en/docs/claude-code/overview

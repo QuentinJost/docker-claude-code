@@ -1,0 +1,23 @@
+# Optional: lets the Claude Code sessions of this container report to Coucou
+# (github.com/Louis-CFM/coucou) on the host desktop. Enable it with
+#   COMPOSE_FILE=compose.yaml:compose.coucou.yaml
+# in .env, once the host has a Coucou that serves COUCOU_EXTRA_SOCKET_DIRS and
+# both directories below exist (see README, "Coucou"). Missing directories are
+# an error, never created: Docker would create them as root, and the relay
+# refuses any socket directory that is not the user's own and private.
+services:
+  claude-code:
+    volumes:
+      # The private directory (0700) Coucou also serves coucou.sock in.
+      - type: bind
+        source: ${COUCOU_RELAY_DIR:-${HOME}/.local/share/coucou/relay}
+        target: /run/coucou
+        bind:
+          create_host_path: false
+      # coucou-hook, as the installed app keeps it up to date.
+      - type: bind
+        source: ${HOME}/.local/share/coucou/bin
+        target: /opt/coucou/bin
+        read_only: true
+        bind:
+          create_host_path: false
