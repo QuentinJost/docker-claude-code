@@ -6,7 +6,11 @@
 !.claude/.gitkeep
 !.claude/statusline.sh
 !.claude/mods/
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/public-apis/
 # types laid down by the engine at every load of a mod
 .claude/mods/*/.claude-plugin/types/
 .env
 .claude.json
+__pycache__/

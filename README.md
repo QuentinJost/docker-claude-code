@@ -15,6 +15,9 @@ typical session by roughly 80%.
 - **Docker CLI** — talks to the host daemon via the mounted socket
 - **Cortex** — the [`cortex`](https://github.com/adorey/cortex) command and its
   agent spec, pinned by `CORTEX_VERSION` (see below)
+- **public-apis skill** — `.claude/skills/public-apis`: searches the
+  [public-apis](https://github.com/public-apis/public-apis) catalogue (~2,000 free APIs),
+  cloned on first use into `~/.cache/public-apis` and pulled once a day
 - Runs as the non-root `www-data` user (UID/GID remapped to 1000)
 
 Mount layout inside the container:
