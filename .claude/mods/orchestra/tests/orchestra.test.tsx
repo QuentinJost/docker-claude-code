@@ -828,6 +828,67 @@ test('/orch prompt naming a listed repo is not routed', async ($, on) => {
   expect(asked[0]?.prompt).toMatch(/^Repo: \/app\/acme\/datalodestar/)
 })
 
+test('/orch prompt naming a folder that is no repo yet is not routed: a new app, made a repo', async ($, on) => {
+  const w = world(on, JSON.stringify(SIZING), upgradeOrSize)
+  w.onPython(argv => (String(argv[1]).endsWith('/repos.py') ? JSON.stringify(REPOS) : '{}'))
+  w.fresh.add('/app/cards')
+  on('fs.list', (_$, e) => {
+    if (e.path !== '/app/cards') {
+      throw new Error(`ENOENT: ${e.path}`)
+    }
+    return { value: [] } as never
+  })
+  const ran = await orch($, 'prompt /app/cards a web app to list cards')
+
+  expect(w.asked[0]?.prompt).toMatch(/^Repo: \/app\/cards/)
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #1 queued in cards') })
+  expect(w.commands).toContainEqual(['git', '-C', '/app/cards', 'init', '--quiet', '--initial-branch=main'])
+})
+
+test('/orch prompt naming a folder that does not exist asks first; yes creates it and goes on', async ($, on) => {
+  const w = world(on, JSON.stringify(SIZING), upgradeOrSize)
+  w.onPython(argv => (String(argv[1]).endsWith('/repos.py') ? JSON.stringify(REPOS) : '{}'))
+  w.missing.add('/app/cards')
+  w.fresh.add('/app/cards')
+  on('fs.list', (_$, e) => {
+    if (e.path !== '/app/cards' || w.missing.has('/app/cards')) {
+      throw new Error(`ENOENT: ${e.path}`)
+    }
+    return { value: [] } as never
+  })
+
+  const asked = await orch($, 'prompt /app/cards a web app to list cards')
+  expect(asked).toMatchObject({ text: expect.stringContaining('/app/cards does not exist. Create it') })
+  expect(w.asked).toHaveLength(0)
+  expect(w.commands.some(c => c[0] === 'mkdir')).toBe(false)
+
+  // Anything but yes or no asks again.
+  expect(await orch($, 'answer maybe')).toMatchObject({ text: expect.stringContaining('/orch answer yes to create /app/cards') })
+
+  w.missing.delete('/app/cards') // what the mkdir does
+  const ran = await orch($, 'answer yes')
+  expect(w.commands).toContainEqual(['mkdir', '-p', '/app/cards'])
+  expect(ran).toMatchObject({ text: expect.stringContaining('Created /app/cards.') })
+  expect(ran).toMatchObject({ text: expect.stringContaining('Task #1 queued in cards') })
+})
+
+test('/orch task naming a folder that does not exist: no creates nothing and queues nothing', async ($, on) => {
+  const w = world(on)
+  w.missing.add('/app/cards')
+  expect(await orch($, 'task /app/cards a web app to list cards')).toMatchObject({ text: expect.stringContaining('/app/cards does not exist') })
+  expect(await orch($, 'answer no')).toMatchObject({ text: expect.stringContaining('not created; nothing queued') })
+  expect(w.commands.some(c => c[0] === 'mkdir')).toBe(false)
+  expect(w.launched).toHaveLength(0)
+  expect(await orch($, 'answer yes')).toMatchObject({ text: expect.stringContaining('No question is waiting') })
+})
+
+test('/orch retry without a task number says how to use it', async ($, on) => {
+  world(on)
+  const ran = await orch($, 'retry')
+  expect(ran).toMatchObject({ text: expect.stringContaining('Usage: /orch retry <id>') })
+  expect(JSON.stringify(ran)).not.toContain('NaN')
+})
+
 test('a task on the stack runs without git, and its review checks the stack', async ($, on) => {
   const { launched, sent } = world(on)
   await orch($, 'task stack reindex the dev_container alias in OpenSearch')

@@ -124,8 +124,8 @@ declare module 'claude-code' {
       remoteSeen: boolean
       /** The Remote Control reminder was given in this session. */
       reminded: boolean
-      /** A request the model answered with questions, kept for /orch answer. */
-      pending: { input: string; questions: string[] } | null
+      /** A request the model answered with questions, or one naming a folder to create, kept for /orch answer. */
+      pending: { input: string; questions: string[]; create?: { repo: string; via: 'task' | 'prompt' } } | null
     }
   }
 }

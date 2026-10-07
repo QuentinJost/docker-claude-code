@@ -78,7 +78,11 @@ const showDone = atom({ plugin: 'orchestra', key: 'showDone' } as const, false)
 const usage = atom({ plugin: 'orchestra', key: 'usage' } as const, {} as Record<string, WorkerUsage>)
 const remoteSeen = atom({ plugin: 'orchestra', key: 'remoteSeen' } as const, false)
 const reminded = atom({ plugin: 'orchestra', key: 'reminded' } as const, false)
-const pending = atom({ plugin: 'orchestra', key: 'pending' } as const, null as { input: string; questions: string[] } | null)
+/** What waits for `/orch answer`: questions on a request, or whether to create the folder it names. */
+const pending = atom(
+  { plugin: 'orchestra', key: 'pending' } as const,
+  null as { input: string; questions: string[]; create?: { repo: string; via: 'task' | 'prompt' } } | null,
+)
 
 /** The checks start this long after the report, from a timer. */
 const CHECK_START_MS = 10
@@ -571,7 +575,58 @@ async function queueTask($: EngineInterface, input: Input): Promise<{ id: number
   return { id, lines: [after.length > 0 ? `Waits for ${after.map(n => `#${n}`).join(', ')} to be approved.` : '', start].filter(Boolean).join('\n') }
 }
 
+/** A plain folder name or path under the root, never a word of a request. */
+const FOLDER = /^[\w.-]+(\/[\w.-]+)*$/
+
+/**
+ * The folder a request names as a path under the root (`/app/<folder> …`) when it does not exist,
+ * or null. Only a path the person typed as such counts: a first word that merely is no repo is a
+ * request to route.
+ */
+async function missingFolder($: EngineInterface, input: string): Promise<string | null> {
+  if (!input.trim().startsWith(`${ROOT}/`)) {
+    return null
+  }
+  const repo = parseTask(input)?.repo ?? ''
+  if (!FOLDER.test(repo)) {
+    return null
+  }
+  return (await $.fs.exists(`${ROOT}/${repo}`).catch(() => false)) ? null : repo
+}
+
+/** Asks whether to create the folder a request names; nothing is queued until the person says. */
+async function askCreate($: EngineInterface, input: string, repo: string, via: 'task' | 'prompt'): Promise<string> {
+  const question = `${ROOT}/${repo} does not exist. Create it (an empty folder, made a new app's repo at dispatch)?`
+  await update($, pending, () => ({ input, questions: [question], create: { repo, via } }))
+  await log($, { direction: 'notice', peer: repo, text: 'folder missing: asked whether to create it; nothing queued' })
+  return ['Not queued yet:', `- ${question}`, '', 'Answer /orch answer yes to create it and go on, or /orch answer no.'].join('\n')
+}
+
+/** `/orch answer` to the folder question: creates it and goes on with the request, or drops it. */
+async function answerCreate($: EngineInterface, asked: { input: string; create: { repo: string; via: 'task' | 'prompt' } }, answer: string): Promise<string> {
+  const { repo, via } = asked.create
+  if (/^(n|no|non)\b/i.test(answer)) {
+    await update($, pending, () => null)
+    return `${ROOT}/${repo} not created; nothing queued.`
+  }
+  if (!/^(y|yes|o|oui|ok|create)\b/i.test(answer)) {
+    return `Answer /orch answer yes to create ${ROOT}/${repo}, or /orch answer no.`
+  }
+  const made = await exec($, ['mkdir', '-p', `${ROOT}/${repo}`])
+  if (made.exitCode !== 0) {
+    return `Could not create ${ROOT}/${repo}: ${oneLine(made.stderr).slice(0, 200)}. Nothing queued.`
+  }
+  await update($, pending, () => null)
+  await log($, { direction: 'notice', peer: repo, text: 'folder created at the person\'s word' })
+  const next = via === 'task' ? await addTask($, asked.input) : await upgradeTask($, asked.input)
+  return [`Created ${ROOT}/${repo}.`, next].join('\n')
+}
+
 async function addTask($: EngineInterface, input: string): Promise<string> {
+  const missing = await missingFolder($, input)
+  if (missing) {
+    return askCreate($, input, missing, 'task')
+  }
   const parsed = parseInput(input)
   if (!parsed) {
     $.ui.toast('Usage: <repo> <description> [@role]')
@@ -587,10 +642,18 @@ async function addTask($: EngineInterface, input: string): Promise<string> {
  * make sense of comes back as questions, and nothing is queued.
  */
 async function upgradeTask($: EngineInterface, input: string): Promise<string> {
+  const missing = await missingFolder($, input)
+  if (missing) {
+    return askCreate($, input, missing, 'prompt')
+  }
   const repos = await listRepos($)
   const first = parseTask(input)?.repo
+  // A folder under the root that is no repo yet is named all the same: a new app, which the
+  // dispatch makes a repo (git init). Only a plain folder name or path, never a word of the request.
+  const isNewFolder =
+    !!first && FOLDER.test(first) && (await $.fs.list(`${ROOT}/${first}`).then(() => true).catch(() => false))
   // A request that does not start with a repo of the workspace is routed: the model picks where.
-  if (repos.length > 0 && !isTarget(first ?? '') && !repos.some(r => r.repo === first)) {
+  if (repos.length > 0 && !isTarget(first ?? '') && !repos.some(r => r.repo === first) && !isNewFolder) {
     return routeTask($, input, repos)
   }
   const parsed = parseInput(input)
@@ -1394,6 +1457,9 @@ async function runCommand($: EngineInterface, args: string) {
       return answers.join('\n\n')
     }
     case 'retry':
+      if (!Number.isInteger(id)) {
+        return 'Usage: /orch retry <id> [note]. A request that was not queued (questions asked) is answered with /orch answer <your answers>.'
+      }
       return serial(() => retryTask($, id, rest.slice(1).join(' ')))
     case 'followup':
       return serial(() => followupTask($, id, rest.slice(1).join(' ')))
@@ -1404,6 +1470,10 @@ async function runCommand($: EngineInterface, args: string) {
       }
       if (rest.length === 0) {
         return 'Usage: /orch answer <your answers>'
+      }
+      if (asked.create) {
+        const create = asked.create
+        return serial(() => answerCreate($, { input: asked.input, create }, rest.join(' ')))
       }
       const input = [asked.input, '', 'Answers to the questions asked about this request:', ...asked.questions.map(q => `- ${q}`), `→ ${rest.join(' ')}`].join('\n')
       return serial(() => upgradeTask($, input))
