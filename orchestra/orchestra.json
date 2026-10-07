@@ -38,6 +38,7 @@
   "newApp": [
     "It runs under Docker Compose: a compose.yaml at the repo root declares every service the app needs (the app built from its own Dockerfile, and any database, cache or worker it uses), so that `docker compose up` starts it with no other step.",
     "Data lives in named volumes, not in bind mounts of host folders; ports and settings come from environment variables with working defaults, documented in a .env.example.",
+    "Its Dockerfile runs the app as the person's own user, never root: `ARG UID=1000` and `ARG GID=1000` (their uid and gid on the host), a user created or reused with those ids, then `USER`; what the app writes on the host belongs to them.",
     "The README says how to start, stop and reset it with Docker Compose.",
     "Check it before reporting: `docker compose config` and `docker compose build` pass, and the app answers once `docker compose up -d` has started it; stop it again afterwards (`docker compose down`). From this container, Docker sees /app as the host's ~/dev: run compose with `--project-directory /home/dremsis/dev/<repo>` when a relative path matters."
   ],
