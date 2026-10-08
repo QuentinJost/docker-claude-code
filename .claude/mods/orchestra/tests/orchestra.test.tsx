@@ -259,7 +259,7 @@ const AUTO_MODE_HOLD =
 
 const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), replyFor: (e: { system?: string; prompt: string }) => string | null = () => sizingReply) => {
   const launched: { name: string; agent: string; model: string; effort: string; prompt: string }[] = []
-  const asked: { model: string; prompt: string }[] = []
+  const asked: { model: string; prompt: string; maxTokens?: number }[] = []
   const stopped: string[] = []
   const sent: { to: string; text: string }[] = []
   let ids = 0
@@ -281,7 +281,7 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     },
   }))
   on('model.complete', (_$, e) => {
-    asked.push({ model: e.model, prompt: e.prompt })
+    asked.push({ model: e.model, prompt: e.prompt, maxTokens: e.maxTokens })
     const reply = replyFor(e)
     return {
       value:
@@ -759,6 +759,21 @@ test('/orch prompt queues nothing when the model does not answer', async ($, on)
   const ran = await orch($, 'prompt acme/core/acme-backend ACME-7300 fix the export')
   expect(launched).toHaveLength(0)
   expect(ran).toMatchObject({ text: expect.stringContaining('nothing queued') })
+  // Why, in a few words: here the API gave no reply.
+  expect(ran).toMatchObject({ text: expect.stringContaining('no reply (api-error)') })
+})
+
+test('/orch prompt leaves the Prompt Manager room for a split, every brief whole', async ($, on) => {
+  const { asked } = world(on, JSON.stringify(SIZING), upgradeOrSize)
+  await orch($, 'prompt acme/core/acme-backend ACME-7300 fix the export')
+  // 2000 tokens cut a back/front split of a new app short, which read as no brief at all.
+  expect(asked[0]?.maxTokens).toBeGreaterThanOrEqual(16000)
+})
+
+test('/orch prompt says when the brief reply is not the JSON asked for', async ($, on) => {
+  world(on, JSON.stringify(SIZING), e => (e.system?.includes('Prompt Manager') ? '{"status":"ready","tasks":[{"title":"cut sh' : JSON.stringify(SIZING)))
+  const ran = await orch($, 'prompt acme/core/acme-backend ACME-7300 fix the export')
+  expect(ran).toMatchObject({ text: expect.stringContaining('the reply was not the expected JSON') })
 })
 
 const REPOS = [

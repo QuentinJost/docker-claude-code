@@ -641,6 +641,25 @@ async function addTask($: EngineInterface, input: string): Promise<string> {
  * (objective, context, task, constraints, done-when) before it is queued; a request it cannot
  * make sense of comes back as questions, and nothing is queued.
  */
+/**
+ * The reply cap of the Prompt Manager and the router: a split into a few tasks, each with its
+ * whole brief, in JSON. 2000 tokens cut such a reply short (seen 2026-10-07 on a new app split
+ * back/front), which then reads as no brief at all. Only what is written is billed.
+ */
+const BRIEF_MAX_TOKENS = 16000
+
+/** Why a Prompt Manager or router call gave nothing to queue, in a few words for the person. */
+function whyUnusable(reply: Awaited<ReturnType<EngineInterface['model']['complete']>> | null): string {
+  if (!reply) {
+    return 'the call was refused'
+  }
+  if (!reply.isAnswered) {
+    return `no reply (${reply.reason})`
+  }
+  const out = reply.usage?.output_tokens ?? 0
+  return out >= BRIEF_MAX_TOKENS ? `the reply was cut at ${out} tokens` : `the reply was not the expected JSON (${reply.text.length} characters)`
+}
+
 async function upgradeTask($: EngineInterface, input: string): Promise<string> {
   const missing = await missingFolder($, input)
   if (missing) {
@@ -661,13 +680,14 @@ async function upgradeTask($: EngineInterface, input: string): Promise<string> {
     return 'Usage: /orch prompt [<repo>] <request> [@role] [model:… effort:…]'
   }
   const reply = await $.model
-    .complete({ model: ORCHESTRATOR_MODEL, system: UPGRADE_SYSTEM, prompt: upgradePrompt(parsed.repo, parsed.role, parsed.text), maxTokens: 2000, effort: 'high' })
+    .complete({ model: ORCHESTRATOR_MODEL, system: UPGRADE_SYSTEM, prompt: upgradePrompt(parsed.repo, parsed.role, parsed.text), maxTokens: BRIEF_MAX_TOKENS, effort: 'high' })
     .catch(() => null)
   const spent = reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0
   const upgrade = reply?.isAnswered ? parseUpgrade(reply.text, parsed.repo) : null
   if (!upgrade) {
-    await log($, { direction: 'notice', peer: 'prompt', text: `no usable brief from ${ORCHESTRATOR_MODEL}; nothing queued` })
-    return `The orchestrator model gave no usable brief; nothing queued. Retry, or queue it as typed with /orch task.`
+    const why = whyUnusable(reply)
+    await log($, { direction: 'notice', peer: 'prompt', text: `no usable brief from ${ORCHESTRATOR_MODEL}: ${why}; nothing queued` })
+    return `The orchestrator model gave no usable brief (${why}); nothing queued. Retry (an answer waiting can be sent again with /orch answer), or queue it as typed with /orch task.`
   }
   if ('questions' in upgrade) {
     await log($, { direction: 'notice', peer: 'prompt', text: `unclear request, ${upgrade.questions.length} question(s) for you; nothing queued` })
@@ -747,13 +767,14 @@ async function routeTask($: EngineInterface, input: string, repos: RepoInfo[]): 
   const role = named.text !== overrides.text ? named.role : null
   const request = named.text
   const reply = await $.model
-    .complete({ model: ORCHESTRATOR_MODEL, system: ROUTE_SYSTEM, prompt: routePrompt(repos, await workspaceOverview($), role, request), maxTokens: 4000, effort: 'high' })
+    .complete({ model: ORCHESTRATOR_MODEL, system: ROUTE_SYSTEM, prompt: routePrompt(repos, await workspaceOverview($), role, request), maxTokens: BRIEF_MAX_TOKENS, effort: 'high' })
     .catch(() => null)
   const spent = reply ? callCost(ORCHESTRATOR_MODEL, reply.usage) : 0
   const routed = reply?.isAnswered ? parseRouting(reply.text, repos) : null
   if (!routed) {
-    await log($, { direction: 'notice', peer: 'prompt', text: `no usable routing from ${ORCHESTRATOR_MODEL}; nothing queued` })
-    return `The orchestrator model could not place the request in a repo; nothing queued. Retry, or name the repo: /orch prompt <repo> <request>.`
+    const why = whyUnusable(reply)
+    await log($, { direction: 'notice', peer: 'prompt', text: `no usable routing from ${ORCHESTRATOR_MODEL}: ${why}; nothing queued` })
+    return `The orchestrator model could not place the request in a repo (${why}); nothing queued. Retry, or name the repo: /orch prompt <repo> <request>.`
   }
   if ('questions' in routed) {
     await log($, { direction: 'notice', peer: 'prompt', text: `request not placed, ${routed.questions.length} question(s) for you; nothing queued` })
