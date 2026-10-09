@@ -295,6 +295,8 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
   const watched: string[] = []
   let refuse: string | null = null
   let holds = 0
+  // Holds of the idle subscription alone (a SendMessage without a message), as auto mode does.
+  let subscriptionHolds = 0
   const submitted: string[] = []
   on('prompt.submit', (_$, e) => {
     if (e.origin.kind === 'plugin') {
@@ -309,6 +311,10 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     }
     if (e.message && holds > 0) {
       holds -= 1
+      return { deny: AUTO_MODE_HOLD } as never
+    }
+    if (!e.message && subscriptionHolds > 0) {
+      subscriptionHolds -= 1
       return { deny: AUTO_MODE_HOLD } as never
     }
     if (!running.has(to) && !others.includes(to)) {
@@ -430,6 +436,9 @@ const world = (on: On, sizingReply: string | null = JSON.stringify(SIZING), repl
     alerts,
     holdSends: (count: number) => {
       holds = count
+    },
+    holdSubscriptions: (count: number) => {
+      subscriptionHolds = count
     },
     onPython: (answer: typeof python) => {
       python = answer
@@ -1804,3 +1813,115 @@ test('dispatch reads the context of the idle workers before reusing one', async 
   await orch($, 'task acme/core/acme-backend third')
   expect(launched.filter(l => !l.name.startsWith('orch-review')).map(l => l.name)).toEqual(['orch-lead-backend-acme-backend', 'orch-lead-backend-acme-backend-2'])
 })
+
+/** A last turn as hooks/lastturn.py prints it. */
+type Turn = { text: string; at: number; ended: boolean }
+
+/**
+ * The world of the transcript sweep: the transcripts folder lists one file per entry of `turns`
+ * (named by the session id it starts with), and lastturn.py answers that entry for it.
+ */
+const sweepWorld = (on: On) => {
+  const w = world(on)
+  const turns: Record<string, Turn> = {}
+  mock.env(on, { HOME: '/home/test' })
+  on('session.id', () => ({ value: 'self0000-0000' }) as never)
+  on('fs.list', () => ({ value: Object.keys(turns).map(id => ({ name: `${id}-0000.jsonl`, kind: 'file', size: 1, mtimeMs: 0, isLink: false })) }) as never)
+  w.onPython(argv => {
+    if (!String(argv[1]).endsWith('/lastturn.py')) {
+      return '{}'
+    }
+    const id = String(argv[2]).split('/').at(-1)?.slice(0, 8) ?? ''
+    return JSON.stringify(turns[id] ?? { text: '', at: 0, ended: false })
+  })
+  return { ...w, turns }
+}
+
+const SWEEP_WORKER = 'orch-lead-backend-datalodestar'
+
+/**
+ * Lets `ms` pass, then refreshes as the pane's button does: the session started before the
+ * test's clock was mocked, so its 30 s timer does not follow that clock.
+ */
+const refreshAfter = async (ui: { press: (q: { key: string }) => Promise<unknown> }, clock: { advance: (ms: number) => Promise<unknown> }, ms: number) => {
+  await clock.advance(ms)
+  await ui.press({ key: 'refresh' })
+  await drain(clock)
+}
+
+const mountPane = ($: Parameters<TestBody>[0]) =>
+  $.ui.mount({ plugin: 'orchestra', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS })
+/** The world clock's start: the brief of the first worker goes at this time. */
+const SWEEP_T0 = Date.UTC(2026, 9, 3, 10, 0)
+
+test('a verdict written in the reviewer\'s transcript but never sent approves the task on the next refresh', async ($, on) => {
+  const { turns, clock, submitted, alerts } = sweepWorld(on)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  await receive($, SWEEP_WORKER, 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/a')
+  // The reviewer (the second session launched) ends its turn with its verdict as text.
+  turns['00000002'] = { text: 'SendMessage to app-22:\n\nVERDICT: APPROVED\nFINDINGS:\n- ⚪ nothing to add', at: SWEEP_T0 + 1000, ended: true }
+  await refreshAfter(ui, clock, 30_000)
+
+  // Approved: the pane hides done tasks, the person's alert says it.
+  expect(alerts.some(a => a.startsWith('Task #1 approved'))).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /wrote its report without sending it/ })).toBeDefined()
+  // The usual write-up goes to the model.
+  expect(submitted.some(text => text.includes('Task #1 approved'))).toBe(true)
+})
+
+test('a worker\'s report written but never sent moves its task on to review', async ($, on) => {
+  const { turns, clock, launched } = sweepWorld(on)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  turns['00000001'] = { text: 'STATUS: done\nSUMMARY: ok\nBRANCH: feat/a', at: SWEEP_T0 + 1000, ended: true }
+  await refreshAfter(ui, clock, 30_000)
+  expect(launched.filter(l => l.agent === 'orch-reviewer')).toHaveLength(1)
+})
+
+test('a worker\'s report written before its current brief is not taken for this round\'s', async ($, on) => {
+  const { turns, clock, launched } = sweepWorld(on)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  turns['00000001'] = { text: 'STATUS: done\nSUMMARY: an earlier round', at: SWEEP_T0 - 60_000, ended: true }
+  await refreshAfter(ui, clock, 30_000)
+  expect(launched.filter(l => l.agent === 'orch-reviewer')).toHaveLength(0)
+  expect(await stateOf(ui, 1)).toBe('● working')
+})
+
+test('a report in a turn that has not ended is left alone', async ($, on) => {
+  const { turns, clock, launched } = sweepWorld(on)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  turns['00000001'] = { text: 'STATUS: done\nSUMMARY: still writing', at: SWEEP_T0 + 1000, ended: false }
+  await refreshAfter(ui, clock, 30_000)
+  expect(launched.filter(l => l.agent === 'orch-reviewer')).toHaveLength(0)
+})
+
+test('a holder gone without a report blocks its task for the person, once past the start grace', async ($, on) => {
+  const { clock, kill, alerts } = sweepWorld(on)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  kill(SWEEP_WORKER)
+  // Unlisted a moment after its launch: maybe still starting.
+  await refreshAfter(ui, clock, 30_000)
+  expect(await stateOf(ui, 1)).toBe('● working')
+  await refreshAfter(ui, clock, 120_000)
+  expect(await stateOf(ui, 1)).toBe('⏸ blocked')
+  expect(alerts.some(a => a.includes('gone without a report'))).toBe(true)
+})
+
+test('an idle subscription auto mode holds is tried again, then said in the feed', async ($, on) => {
+  const first = sweepWorld(on)
+  first.holdSubscriptions(1)
+  await orch($, 'task acme/datalodestar ACME-7400 delete a database')
+  const ui = await mountPane($)
+  // Held once: the second try takes.
+  expect(first.watched).toContain(SWEEP_WORKER)
+  expect(await ui.find({ type: 'Text', text: /idle watch not set/ })).toBeUndefined()
+
+  first.holdSubscriptions(2)
+  await orch($, 'task acme/core/acme-frontend ACME-7402 a third one')
+  expect(await ui.find({ type: 'Text', text: /idle watch not set/ })).toBeDefined()
+})
+

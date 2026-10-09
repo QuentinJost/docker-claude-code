@@ -84,6 +84,8 @@ export type Worker = {
   brief?: string
   /** How many times that brief went again. */
   nudges?: number
+  /** When its current brief went (ms): a report written before it belongs to an earlier brief. */
+  briefedAt?: number
 }
 
 /** What a session has consumed, read from its transcript; the cost is an estimate at API rates. */

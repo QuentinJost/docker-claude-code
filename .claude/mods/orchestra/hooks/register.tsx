@@ -177,10 +177,82 @@ async function listSessions($: EngineInterface): Promise<Set<string> | null> {
 const isGone = (name: string, live: Set<string> | null): boolean => live !== null && !live.has(name)
 
 async function refresh($: EngineInterface) {
-  await listSessions($)
+  const live = await listSessions($)
   // Best effort: usage is shown when it can be read, and never stops the rest.
   await refreshUsage($).catch(() => undefined)
+  // Like a report, it changes tasks: in turn with the rest. refresh itself never runs inside serial.
+  await serial(() => recoverReports($, live)).catch(() => undefined)
   await saveQueue($).catch(() => undefined)
+}
+
+/** A session's report must have waited this long in its transcript: one it sent may still be on its way. */
+const RECOVER_GRACE_MS = IDLE_GRACE_MS
+/** A task's holder unlisted for this long after the task last moved is gone, not still starting. */
+const GONE_GRACE_MS = 120_000
+
+/** The last turn of a session, read from its transcript (hooks/lastturn.py); null when there is none to read. */
+async function lastTurn($: EngineInterface, bgId: string): Promise<{ text: string; at: number; ended: boolean } | null> {
+  const dir = await transcriptsDir($)
+  const file = (await $.fs.list(dir).catch(() => [])).find(f => f.name.startsWith(bgId) && f.name.endsWith('.jsonl'))?.name
+  if (!file) {
+    return null
+  }
+  const ran = await exec($, ['python3', `${$.plugin.root}/hooks/lastturn.py`, `${dir}/${file}`])
+  try {
+    const turn = JSON.parse(ran.stdout) as { text?: unknown; at?: unknown; ended?: unknown }
+    return { text: String(turn.text ?? ''), at: Number(turn.at) || 0, ended: turn.ended === true }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Catches what the idle watchdog misses: a worker or reviewer that wrote its report as the text of
+ * its turn instead of sending it (seen 2026-10-09: "SendMessage to app-b5: … VERDICT: APPROVED"),
+ * or whose session is gone without a word. The report is read from its transcript and handled as
+ * if it had come in; a holder gone with nothing to read blocks its task for the person, instead of
+ * a task that waits forever. Runs inside serial().
+ */
+async function recoverReports($: EngineInterface, live: Set<string> | null) {
+  const now = await $.clock.now()
+  for (const task of (await read($, tasks)).filter(t => t.state === 'working' || t.state === 'reviewing')) {
+    const name = task.state === 'reviewing' ? task.reviewer : task.worker
+    const holder = (await read($, workers)).find(w => w.name === name && w.task === task.id)
+    if (!holder) {
+      continue
+    }
+    const isReviewer = holder.role === 'reviewer'
+    // A worker's transcript holds its reports of every round: only one written after its current
+    // brief is this round's. A reviewer is a fresh session per round, so all its text is. A worker
+    // briefed before briefedAt existed is never salvaged.
+    const since = isReviewer ? 0 : holder.briefedAt
+    const turn = since === undefined ? null : await lastTurn($, holder.bgId)
+    const hasReport =
+      turn !== null &&
+      turn.ended &&
+      turn.at >= (since ?? 0) &&
+      (isReviewer ? parseVerdict(turn.text) !== null : parseStatus(turn.text) !== null)
+    if (turn && hasReport && now - turn.at < RECOVER_GRACE_MS) {
+      // Written just now: the send, if any, is on its way. The next refresh looks again.
+      continue
+    }
+    if (turn && hasReport) {
+      await notify($, `#${task.id}`, `${name} wrote its report without sending it: read from its transcript`)
+      const { digest } = await onReceive($, `<cross-session-message from-name="${name}">\n${turn.text}\n</cross-session-message>`)
+      if (digest) {
+        // The approval's write-up goes to the model as for a report that came in; from a timer,
+        // as a hook-held turn may not submit.
+        $.clock.after(HANDOFF_DELAY_MS, () => void $.prompt.submit({ text: digest }))
+      }
+      continue
+    }
+    // A session launched a moment ago may not be listed yet.
+    if (isGone(name, live) && now - task.updatedAt >= GONE_GRACE_MS) {
+      await patchTask($, task.id, { state: 'blocked', report: blockedReport(`${name} is gone and left no report`) })
+      await notify($, `#${task.id}`, `${name} is gone without a report: your call (/orch retry ${task.id} or /orch drop ${task.id})`)
+      await alertPerson($, `Task #${task.id} blocked: ${name} is gone without a report`)
+    }
+  }
 }
 
 /** What a session's queue file holds: enough for another session to take the queue over. */
@@ -985,7 +1057,7 @@ async function dispatch($: EngineInterface) {
 
     if (worker) {
       await patchTask($, task.id, { state: 'working', branchFrom, base: started.base, worker: worker.name })
-      await patchWorker($, worker.name, { task: task.id, brief, nudges: 0 })
+      await patchWorker($, worker.name, { task: task.id, brief, nudges: 0, briefedAt: await $.clock.now() })
       if ((await send($, worker.name, brief, true)) === null) {
         continue
       }
@@ -1006,17 +1078,35 @@ async function dispatch($: EngineInterface) {
       await alertPerson($, `Task #${task.id} blocked: its worker session could not be launched`)
       continue
     }
-    await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: task.role, ...work, task: task.id, brief, nudges: 0 }])
+    const briefedAt = await $.clock.now()
+    await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: task.role, ...work, task: task.id, brief, nudges: 0, briefedAt }])
     await patchTask($, task.id, { state: 'working', branchFrom, base: started.base, worker: name })
     // The brief went with the launch; the idle subscription alone goes now.
     await subscribeIdle($, name)
   }
 }
 
-/** Subscribes to a session's next idle notice without sending it anything. */
+/**
+ * Subscribes to a session's next idle notice without sending it anything. A subscription that
+ * did not take is said in the feed: without it the idle watchdog never fires for that session,
+ * and only the transcript sweep (recoverReports) catches a report it fails to send.
+ */
 async function subscribeIdle($: EngineInterface, name: string) {
-  // An empty message is the tool's own spelling of "subscribe only".
-  await $.tool.call({ tool: 'SendMessage', to: name, message: '', notify_when_idle: true }).catch(() => undefined)
+  const call = async () =>
+    deliveryFailure(
+      // An empty message is the tool's own spelling of "subscribe only".
+      await $.tool
+        .call({ tool: 'SendMessage', to: name, message: '', notify_when_idle: true })
+        .catch((error: unknown) => ({ deny: String(error), isError: undefined, result: undefined, text: undefined })),
+    )
+  let reason = await call()
+  // As for a message: the classifier's own advice on a hold is to try once more, as is.
+  if (reason !== null && isAutoModeHold(reason)) {
+    reason = await call()
+  }
+  if (reason !== null) {
+    await notify($, name, `idle watch not set: ${oneLine(reason).slice(0, 200)}`)
+  }
 }
 
 async function startReview($: EngineInterface, task: Task) {
@@ -1031,7 +1121,8 @@ async function startReview($: EngineInterface, task: Task) {
     await alertPerson($, `Task #${task.id} blocked: its reviewer session could not be launched`)
     return
   }
-  await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: 'reviewer', ...review, task: task.id, brief, nudges: 0 }])
+  const briefedAt = await $.clock.now()
+  await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: 'reviewer', ...review, task: task.id, brief, nudges: 0, briefedAt }])
   await patchTask($, task.id, { state: 'reviewing', reviewer: name })
   await subscribeIdle($, name)
 }
@@ -1218,7 +1309,8 @@ async function replaceWorker($: EngineInterface, task: Task, text: string): Prom
   if (!bgId) {
     return { worker: task.worker, isFresh: false, reason: `${task.worker} is gone and no new session could be launched` }
   }
-  await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: task.role, ...work, task: task.id, brief, nudges: 0 }])
+  const briefedAt = await $.clock.now()
+  await update($, workers, list => [...list, { name, bgId, repo: task.repo, role: task.role, ...work, task: task.id, brief, nudges: 0, briefedAt }])
   await patchTask($, task.id, { worker: name })
   await subscribeIdle($, name)
 
@@ -1227,7 +1319,7 @@ async function replaceWorker($: EngineInterface, task: Task, text: string): Prom
 
 /** Sends a worker its (new) brief, kept for a resend, with the idle subscription. */
 async function sendBrief($: EngineInterface, name: string, text: string): Promise<string | null> {
-  await patchWorker($, name, { brief: text, nudges: 0 })
+  await patchWorker($, name, { brief: text, nudges: 0, briefedAt: await $.clock.now() })
   return send($, name, text, true)
 }
 

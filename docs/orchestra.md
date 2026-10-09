@@ -32,6 +32,13 @@ built-in transport (`claude --bg`, `SendMessage`, `ListAgents`): no daemon.
    NEEDS` with `SendMessage`. The report format and the orchestrator's name are also in its agent
    definition, which a compaction never summarises. An idle worker past half its context window is
    not given another task: a fresh session is.
+
+   A session that goes idle without reporting gets its brief again once, then the task goes to
+   the person. That watch rests on an idle subscription, which auto mode may hold (the feed then
+   says "idle watch not set"). So every refresh (30 s) also reads the last turn of each working
+   worker and reviewer from its transcript: a report written there but never sent (a turn ending
+   with "SendMessage to …: VERDICT: …" as text) is handled as if it had come in, and a session
+   gone with no report blocks its task for the person.
 4. **Checks.** The commands the workspace names (`checks`) run in the repo before any review; a
    failure goes back to the worker with its output (twice at most), and spares a review session.
 5. **Review.** A fresh reviewer session per round returns `VERDICT / FINDINGS`. Three rejected
