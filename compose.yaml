@@ -7,6 +7,8 @@ services:
       - "${DOCKER_GID:-999}"   # match host GID
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # The host's time zone, daylight saving included (tzdata is in the image).
+      - /etc/localtime:/etc/localtime:ro
       - .config:/var/www/.config
       - .claude:/var/www/.claude
       - .claude.json:/var/www/.claude.json

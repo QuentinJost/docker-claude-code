@@ -30,6 +30,7 @@ Mount layout inside the container:
 | `/var/www/.claude.json` | `./.claude.json` | Claude Code global state file (persists) |
 | `/var/www/.config` | `./.config` | Misc tool config (persists) |
 | `/var/run/docker.sock` | host socket | Docker-in-Docker access |
+| `/etc/localtime` (read-only) | host time zone | The container keeps the host's local time |
 
 ## Prerequisites
 
