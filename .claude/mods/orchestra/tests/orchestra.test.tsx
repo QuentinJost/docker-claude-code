@@ -1780,6 +1780,10 @@ test('the report format and the orchestrator\'s name live in the agent definitio
   expect(stack).not.toContain('BRANCH:')
   const reviewer = JSON.parse(reviewerAgent('mtg', 'app-22'))['orch-reviewer'].prompt as string
   expect(reviewer).toContain('VERDICT: APPROVED | CHANGES_REQUESTED')
+  // SendMessage is deferred in these sessions: unloaded, a verdict once went out as plain text.
+  for (const prompt of [worker, stack, reviewer]) {
+    expect(prompt).toContain('load it with ToolSearch (query "select:SendMessage"), then call the SendMessage tool itself')
+  }
 })
 
 test('an idle worker past half its context gets no new task', () => {

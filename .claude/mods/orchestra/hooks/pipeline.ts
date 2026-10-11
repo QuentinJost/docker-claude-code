@@ -389,6 +389,9 @@ const wsOf = (repo: string) => workspaceOf(repo) ?? targetOf(repo)?.ws ?? null
 const reportRules = (self: string, lines: readonly string[]): string[] => [
   `How you report, every time, also after your context was compacted: with SendMessage to the orchestrator${self ? `, "${self}" (or the session a later [ORCH <name> …] message names)` : ', the session named in the [ORCH <name> …] header of your latest brief'}, in exactly this format, one field per line:`,
   ...lines,
+  // Seen 2026-10-09: a reviewer that never loaded the deferred tool wrote "SendMessage to …"
+  // as its reply, and the verdict reached no one.
+  'SendMessage is a deferred tool in this session: before your first report, load it with ToolSearch (query "select:SendMessage"), then call the SendMessage tool itself. A report written as the text of your reply, "SendMessage to …" included, reaches no one: the orchestrator only gets what the tool delivers.',
 ]
 
 export const workerAgent = (role: string, repo = '', self = ''): string => {
